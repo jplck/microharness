@@ -1,0 +1,9 @@
+/main
+/main.exe
+*.test
+/coverage.out
+/coverage.html
+
+.env
+.env.*
+!.env.example
