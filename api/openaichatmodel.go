@@ -13,7 +13,7 @@ type OpenAIChatModel struct {
 	Client openai.Client
 }
 
-func (model *OpenAIChatModel) Call(ctx context.Context, prompt string, tools []openai.ChatCompletionToolUnionParam) (string, error) {
+func (model *OpenAIChatModel) Call(ctx context.Context, prompt string, tools []Tool) (string, error) {
 	if model.Config.Endpoint == "" {
 		return "", fmt.Errorf("endpoint is required")
 	}
@@ -24,12 +24,17 @@ func (model *OpenAIChatModel) Call(ctx context.Context, prompt string, tools []o
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 
+	var openaiTools []openai.ChatCompletionToolUnionParam
+    for _, tool := range tools {
+        openaiTools = append(openaiTools, tool.AsOpenAITool())
+    }
+
 	result, err := model.Client.Chat.Completions.New(ctx, openai.ChatCompletionNewParams{
 		Model: model.Config.Name,
 		Messages: []openai.ChatCompletionMessageParamUnion{
 			openai.UserMessage(prompt),
 		},
-		Tools: tools,
+		Tools: openaiTools,
 	})
 	if err != nil {
 		return "", fmt.Errorf("call model %q: %w", model.Config.Name, err)

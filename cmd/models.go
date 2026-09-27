@@ -62,7 +62,22 @@ var callModelCmd = &cobra.Command{
 			return fmt.Errorf("create model client: %w", err)
 		}
 
-		response, err := client.Call(cmd.Context(), prompt, nil)
+		tools := []api.Tool{
+			{
+				Name:        "get_time",
+				Description: "Get the current time in a specific location",
+				Parameters: []api.Parameter{
+					{
+						Name:        "location",
+						Type:        api.String,
+						Description: "The location to get the current time for",
+						Required:    true,
+					},
+				},
+			},
+		}
+
+		response, err := client.Call(cmd.Context(), prompt, tools)
 		if err != nil {
 			return fmt.Errorf("call model %q: %w", modelName, err)
 		}

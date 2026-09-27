@@ -7,7 +7,6 @@ import (
 	"os"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/openai/openai-go/v3"
 )
 
 type Provider string
@@ -77,7 +76,7 @@ func ListModels() ([]Model, error) {
 }
 
 type ModelCall interface {
-	Call(ctx context.Context, prompt string, tools []openai.ChatCompletionToolUnionParam) (string, error)
+	Call(ctx context.Context, prompt string, tools []Tool) (string, error)
 }
 
 func NewModelClient(config Model) (ModelCall, error) {

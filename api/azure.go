@@ -14,7 +14,7 @@ type AzureModel struct {
 	Config Model
 }
 
-func (model *AzureModel) Call(ctx context.Context, prompt string, tools []openai.ChatCompletionToolUnionParam) (string, error) {
+func (model *AzureModel) Call(ctx context.Context, prompt string, tools []Tool) (string, error) {
 	config := model.Config
 
 	var authOption option.RequestOption
@@ -40,7 +40,7 @@ func (model *AzureModel) Call(ctx context.Context, prompt string, tools []openai
 		authOption = option.WithAPIKey(token.Token)
 	}
 
-	client := OpenAIChatModel{
+	client := &OpenAIChatModel{
 		Config: model.Config,
 		Client: openai.NewClient(
 			option.WithBaseURL(model.Config.Endpoint),

@@ -11,7 +11,7 @@ type OpenAIModel struct {
 	Config Model
 }
 
-func (model *OpenAIModel) Call(ctx context.Context, prompt string, tools []openai.ChatCompletionToolUnionParam) (string, error) {
+func (model *OpenAIModel) Call(ctx context.Context, prompt string, tools []Tool) (string, error) {
 	client := &OpenAIChatModel{
 		Config: model.Config,
 		Client: openai.NewClient(
