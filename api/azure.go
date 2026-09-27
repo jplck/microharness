@@ -14,13 +14,13 @@ type AzureModel struct {
 	Config Model
 }
 
-func (model *AzureModel) Call(ctx context.Context, prompt string, tools []Tool) (string, error) {
+func (model *AzureModel) Call(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
 	config := model.Config
 
 	var authOption option.RequestOption
 	if config.APIKeyEnv != "" || config.APIKey != "" {
 		if config.APIKey == "" {
-			return "", fmt.Errorf(
+			return Message{}, fmt.Errorf(
 				"API key is missing or empty for model %q",
 				config.Name,
 			)
@@ -29,13 +29,13 @@ func (model *AzureModel) Call(ctx context.Context, prompt string, tools []Tool) 
 	} else {
 		credential, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			return "", fmt.Errorf("create Azure credential: %w", err)
+			return Message{}, fmt.Errorf("create Azure credential: %w", err)
 		}
 		token, err := credential.GetToken(ctx, policy.TokenRequestOptions{
 			Scopes: []string{"https://cognitiveservices.azure.com/.default"},
 		})
 		if err != nil {
-			return "", fmt.Errorf("get Azure token: %w", err)
+			return Message{}, fmt.Errorf("get Azure token: %w", err)
 		}
 		authOption = option.WithAPIKey(token.Token)
 	}
@@ -48,5 +48,5 @@ func (model *AzureModel) Call(ctx context.Context, prompt string, tools []Tool) 
 			option.WithMaxRetries(0),
 		),
 	}
-	return client.Call(ctx, prompt, tools)
+	return client.Call(ctx, messages, tools)
 }

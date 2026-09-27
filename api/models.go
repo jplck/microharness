@@ -76,7 +76,7 @@ func ListModels() ([]Model, error) {
 }
 
 type ModelCall interface {
-	Call(ctx context.Context, prompt string, tools []Tool) (string, error)
+	Call(ctx context.Context, messages []Message, tools []Tool) (Message, error)
 }
 
 func NewModelClient(config Model) (ModelCall, error) {

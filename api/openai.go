@@ -11,7 +11,7 @@ type OpenAIModel struct {
 	Config Model
 }
 
-func (model *OpenAIModel) Call(ctx context.Context, prompt string, tools []Tool) (string, error) {
+func (model *OpenAIModel) Call(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
 	client := &OpenAIChatModel{
 		Config: model.Config,
 		Client: openai.NewClient(
@@ -20,5 +20,5 @@ func (model *OpenAIModel) Call(ctx context.Context, prompt string, tools []Tool)
 			option.WithMaxRetries(0),
 		),
 	}
-	return client.Call(ctx, prompt, tools)
+	return client.Call(ctx, messages, tools)
 }

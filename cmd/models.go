@@ -1,6 +1,8 @@
 package cmd
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -30,15 +32,6 @@ var listModelsCmd = &cobra.Command{
 
 		return nil
 	},
-}
-
-// sample tool
-func getTime(location string) string {
-	loc, err := time.LoadLocation(location)
-	if err != nil {
-		loc = time.UTC
-	}
-	return fmt.Sprintf("%s", time.Now().In(loc).Format(time.RFC3339))
 }
 
 var callModelCmd = &cobra.Command{
@@ -74,14 +67,27 @@ var callModelCmd = &cobra.Command{
 						Required:    true,
 					},
 				},
+				Execute: func(ctx context.Context, arguments json.RawMessage) (string, error) {
+					var params struct {
+						Location string `json:"location"`
+					}
+					if err := json.Unmarshal(arguments, &params); err != nil {
+						return "", fmt.Errorf("invalid arguments: %w", err)
+					}
+					return fmt.Sprintf("Current time in %s: %s", params.Location, time.Now().Format(time.RFC3339)), nil
+				},
 			},
 		}
 
-		response, err := client.Call(cmd.Context(), prompt, tools)
+		agent, err := api.CreateAgent(cmd.Context(), client, tools, "cli-agent", "Follow the instructions carefully.", "OBGXQCKYQV7NTMI4BJBMEMMUUK")
 		if err != nil {
-			return fmt.Errorf("call model %q: %w", modelName, err)
+			return fmt.Errorf("create agent: %w", err)
 		}
 
+		response, err := agent.Execute(cmd.Context(), api.Message{Role: "user", Content: prompt})
+		if err != nil {
+			return fmt.Errorf("execute agent: %w", err)
+		}
 		fmt.Println("Response:", response)
 		return nil
 	},
