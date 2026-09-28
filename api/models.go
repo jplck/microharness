@@ -4,9 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/openai/openai-go/v3"
+	"github.com/openai/openai-go/v3/option"
 )
 
 type Provider string
@@ -81,16 +86,30 @@ type ModelCall interface {
 }
 
 func NewModelClient(config Model) (ModelCall, error) {
-	switch config.Provider {
-	case ProviderOpenAI:
-		return &OpenAIModel{Config: config}, nil
-	case ProviderAzure:
-		return &AzureModel{Config: config}, nil
+	options := []option.RequestOption{option.WithBaseURL(config.Endpoint), option.WithMaxRetries(0)}
+	switch {
+	case config.Provider != ProviderOpenAI && config.Provider != ProviderAzure:
+		return nil, fmt.Errorf("unsupported provider %q", config.Provider)
+	case config.Provider == ProviderOpenAI || config.APIKeyEnv != "" || config.APIKey != "":
+		options = append(options, option.WithAPIKey(config.APIKey))
 	default:
-		return nil, fmt.Errorf(
-			"unsupported provider %q", config.Provider,
-		)
+		// azure.WithTokenCredential requires azure.WithEndpoint, which rewrites /openai/v1/ paths.
+		credential, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, fmt.Errorf("create Azure credential: %w", err)
+		}
+		options = append(options, option.WithMiddleware(func(request *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+			token, err := credential.GetToken(request.Context(), policy.TokenRequestOptions{
+				Scopes: []string{"https://cognitiveservices.azure.com/.default"},
+			})
+			if err != nil {
+				return nil, fmt.Errorf("get Azure token: %w", err)
+			}
+			request.Header.Set("Authorization", "Bearer "+token.Token)
+			return next(request)
+		}))
 	}
+	return &OpenAIChatModel{Config: config, Client: openai.NewClient(options...)}, nil
 }
 
 func GetModelByName(name string) (*Model, error) {
