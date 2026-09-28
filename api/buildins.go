@@ -64,5 +64,50 @@ func MemoryTools(ctx context.Context, store *MemoryStore) []Tool {
 				return fmt.Sprintf("Written to memory: '%s' at %s", arguments.Content, time.Now().Format(time.RFC3339)), nil
 			}),
 		},
+		{
+			Name:        "update_memory",
+			Description: "Update specific information in the memory",
+			Parameters: []Parameter{
+				{
+					Name:        "id",
+					Type:        String,
+					Description: "The ID of the memory entry to update",
+					Required:    true,
+				},
+				{
+					Name:        "kind",
+					Type:        String,
+					Description: "Memory kind: fact, episode, or procedure",
+					Required:    true,
+				},
+				{
+					Name:        "content",
+					Type:        String,
+					Description: "The content to update in the memory",
+					Required:    true,
+				},
+			},
+			Execute: JSONHandler(func(ctx context.Context, arguments struct {
+				Kind    string `json:"kind"`
+				Content string `json:"content"`
+				ID      string `json:"id"`
+			}) (string, error) {
+
+				switch arguments.Kind {
+				case "fact", "episode", "procedure":
+				default:
+					return "", fmt.Errorf("kind must be fact, episode, or procedure")
+				}
+
+				if _, err := store.Update(ctx, Memory{
+					Kind:    arguments.Kind,
+					Content: arguments.Content,
+					ID:      arguments.ID,
+				}); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("Updated memory: '%s' at %s", arguments.Content, time.Now().Format(time.RFC3339)), nil
+			}),
+		},
 	}
 }
