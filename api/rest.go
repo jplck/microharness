@@ -112,7 +112,7 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			http.Error(w, "cannot resolve model", http.StatusBadRequest)
 			return
 		}
-		_, err = env.CreateAgent(ctx, config.Name, nil, name, "", env.InitialAgent == nil)
+		_, err = env.CreateAgent(ctx, config.Name, nil, name, r.URL.Query().Get("instructions"), env.InitialAgent == nil)
 		if err != nil {
 			log.Printf("agent creation failed: name=%s error=%v", name, err)
 			http.Error(w, "cannot create agent", http.StatusInternalServerError)

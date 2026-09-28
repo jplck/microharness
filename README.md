@@ -11,11 +11,15 @@ go run main.go serve
 ```sh
 go run main.go environment create team
 go run main.go environment create-agent team coordinator gpt-5.4-mini
-go run main.go environment create-agent team researcher gpt-5.4-mini
+go run main.go environment create-agent team researcher gpt-5.4-mini --instructions "Research technical questions and report concise findings."
 go run main.go environment message team coordinator "Message researcher to investigate this task."
 go run main.go environment inbox team coordinator
 go run main.go environment inbox team researcher
 ```
+
+`create-agent --instructions` adds agent-specific instructions to the default
+system prompt and persists them across restarts. Omitting the flag keeps the
+default prompt. This creates a new agent; it does not update an existing agent.
 
 `message` prints the accepted envelope ID, not the recipient's answer. The agent's
 conversation and final output are saved in its session file. Each agent receives

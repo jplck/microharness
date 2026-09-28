@@ -50,9 +50,16 @@ var environmentCreateAgentCmd = &cobra.Command{
 	Short: "Create an agent within an environment",
 	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
+		instructions, err := cmd.Flags().GetString("instructions")
+		if err != nil {
+			return err
+		}
 		path := "/environments/" + url.PathEscape(args[0]) +
 			"/agents/" + url.PathEscape(args[1]) +
-			"?" + url.Values{"model": []string{args[2]}}.Encode()
+			"?" + url.Values{
+			"model":        []string{args[2]},
+			"instructions": []string{instructions},
+		}.Encode()
 		return runtimeRequest(cmd, http.MethodPost, path, nil)
 	},
 }
@@ -227,6 +234,7 @@ func init() {
 	environmentCmd.PersistentFlags().StringVar(
 		&environmentSocket, "socket", "/tmp/micro.sock", "Runtime Unix socket",
 	)
+	environmentCreateAgentCmd.Flags().String("instructions", "", "Agent-specific instructions added to the default system prompt")
 	environmentCmd.AddCommand(environmentCreateCmd, environmentListCmd, environmentCreateAgentCmd)
 	environmentMessageCmd.Flags().String("sender", "cli", "External sender identity")
 	environmentMessageCmd.Flags().String("conversation", "", "Conversation ID (generated when omitted)")

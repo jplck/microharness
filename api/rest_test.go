@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -91,7 +92,9 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 		}
 	}
 	post("/environments/test", http.StatusCreated)
-	post("/environments/test/agents/assistant?model=test-model", http.StatusCreated)
+	instructions := "Research technical questions & report findings.\nInclude sources + note uncertainty?"
+	query := url.Values{"model": []string{"test-model"}, "instructions": []string{instructions}}
+	post("/environments/test/agents/assistant?"+query.Encode(), http.StatusCreated)
 	stop()
 	loaded, err := LoadAgentEnvironment(ctx, root, "test", registry)
 	if err != nil {
@@ -99,6 +102,11 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 	}
 	if len(loaded.Agents) != 1 || loaded.InitialAgent != loaded.Agents[0] {
 		t.Fatal("REST-created agent was not persisted")
+	}
+	if loaded.InitialAgent.Instructions != instructions || len(loaded.InitialAgent.Session.Messages) == 0 ||
+		loaded.InitialAgent.Session.Messages[0].Role != "system" ||
+		!strings.HasSuffix(loaded.InitialAgent.Session.Messages[0].Content, "Agent-specific instructions:\n"+instructions) {
+		t.Fatal("custom instructions were not persisted or added to the system prompt")
 	}
 	client, stop = startTestRuntime(t, root)
 	response, err := client.Get("http://localhost/environments")
@@ -123,6 +131,13 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 	}
 	if restored.ID != loaded.ID || len(restored.Agents) != 2 || restored.InitialAgent.Session.SessionID != loaded.InitialAgent.Session.SessionID {
 		t.Fatal("restart lost original identity, agents, or session")
+	}
+	if restored.InitialAgent.Instructions != instructions ||
+		restored.InitialAgent.Session.Messages[0].Content != loaded.InitialAgent.Session.Messages[0].Content {
+		t.Fatal("restart changed custom instructions or the system prompt")
+	}
+	if restored.Agents[1].Instructions != "" || strings.Contains(restored.Agents[1].Session.Messages[0].Content, "Agent-specific instructions:") {
+		t.Fatal("omitting instructions changed the default prompt")
 	}
 }
 
