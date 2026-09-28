@@ -19,17 +19,17 @@ const (
 )
 
 type Parameter struct {
-	Name        string
-	Type        ParameterType
-	Description string
-	Required    bool
+	Name        string        `json:"name"`
+	Type        ParameterType `json:"type"`
+	Description string        `json:"description"`
+	Required    bool          `json:"required"`
 }
 
 type Tool struct {
 	Name        string
 	Description string
 	Parameters  []Parameter
-	Execute     func(context.Context, json.RawMessage) (string, error)
+	Execute     func(context.Context, json.RawMessage) (string, error) `json:"-"`
 }
 
 func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {

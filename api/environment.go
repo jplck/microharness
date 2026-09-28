@@ -1,0 +1,191 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+)
+
+var validStateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+
+type ToolRegistry map[string]Tool
+
+type AgentEnvironment struct {
+	Agents       []*Agent
+	MemoryStore  *MemoryStore
+	InitialAgent *Agent
+	DataRoot     string
+	ID           string
+	Name         string
+}
+
+type EnvironmentState struct {
+	Version          int          `json:"version"`
+	ID               string       `json:"id"`
+	Name             string       `json:"name"`
+	EmbeddingModel   string       `json:"embedding_model"`
+	InitialAgentName string       `json:"initial_agent_name,omitempty"`
+	Agents           []AgentState `json:"agents"`
+}
+
+type AgentState struct {
+	Name         string     `json:"name"`
+	ModelName    string     `json:"model_name"`
+	Instructions string     `json:"instructions,omitempty"`
+	SessionID    string     `json:"session_id"`
+	ToolNames    []string   `json:"tools,omitempty"`
+	Inbox        []Envelope `json:"inbox,omitempty"`
+}
+
+func NewAgentEnvironment(ctx context.Context, dataRoot, name string) (*AgentEnvironment, error) {
+	if !validStateName.MatchString(name) {
+		return nil, fmt.Errorf("invalid environment name %q", name)
+	}
+	directory := filepath.Join(dataRoot, name)
+	if _, err := os.Stat(filepath.Join(directory, "environment.json")); err == nil {
+		return nil, fmt.Errorf("environment %q already exists: %w", name, os.ErrExist)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	store, err := LoadMemories(ctx, filepath.Join(directory, "memory.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load memories: %w", err)
+	}
+	store.EmbeddingModel = "nomic-embed-text"
+	env := &AgentEnvironment{
+		Agents: []*Agent{}, MemoryStore: store, DataRoot: directory,
+		ID: generateSessionID(), Name: name,
+	}
+	if err := env.Save(); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry ToolRegistry) (*AgentEnvironment, error) {
+	if !validStateName.MatchString(name) {
+		return nil, fmt.Errorf("invalid environment name %q", name)
+	}
+	directory := filepath.Join(dataRoot, name)
+	data, err := os.ReadFile(filepath.Join(directory, "environment.json"))
+	if err != nil {
+		return nil, fmt.Errorf("read environment: %w", err)
+	}
+	var state EnvironmentState
+	if err := json.Unmarshal(data, &state); err != nil {
+		return nil, fmt.Errorf("decode environment: %w", err)
+	}
+	if state.Version == 0 {
+		var legacy struct {
+			MemoryStore *struct{ EmbeddingModel string }
+		}
+		if err := json.Unmarshal(data, &legacy); err != nil {
+			return nil, fmt.Errorf("decode legacy environment: %w", err)
+		}
+		if legacy.MemoryStore == nil || len(state.Agents) != 0 {
+			return nil, fmt.Errorf("legacy environment %q cannot be restored: agent model names were not persisted", name)
+		}
+		state.Version = 1
+		state.EmbeddingModel = legacy.MemoryStore.EmbeddingModel
+	}
+	if state.Version != 1 {
+		return nil, fmt.Errorf("unsupported environment version %d", state.Version)
+	}
+	if state.ID == "" || state.Name != name {
+		return nil, fmt.Errorf("invalid environment identity for %q", name)
+	}
+	store, err := LoadMemories(ctx, filepath.Join(directory, "memory.json"))
+	if err != nil {
+		return nil, fmt.Errorf("load memories: %w", err)
+	}
+	store.EmbeddingModel = state.EmbeddingModel
+	env := &AgentEnvironment{
+		Agents: make([]*Agent, 0, len(state.Agents)), MemoryStore: store,
+		DataRoot: directory, ID: state.ID, Name: state.Name,
+	}
+	seen := make(map[string]bool)
+	for _, saved := range state.Agents {
+		if !validStateName.MatchString(saved.Name) || seen[saved.Name] || saved.SessionID == "" {
+			return nil, fmt.Errorf("invalid or duplicate agent %q", saved.Name)
+		}
+		seen[saved.Name] = true
+		tools := make([]Tool, 0, len(saved.ToolNames))
+		for _, toolName := range saved.ToolNames {
+			tool, ok := registry[toolName]
+			if !ok || tool.Name != toolName || tool.Execute == nil {
+				return nil, fmt.Errorf("agent %q requires registered tool %q", saved.Name, toolName)
+			}
+			tools = append(tools, tool)
+		}
+		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID)
+		if err != nil {
+			return nil, fmt.Errorf("restore agent %q: %w", saved.Name, err)
+		}
+		agent.Inbox = saved.Inbox
+		env.Agents = append(env.Agents, agent)
+		if saved.Name == state.InitialAgentName {
+			env.InitialAgent = agent
+		}
+	}
+	if state.InitialAgentName != "" && env.InitialAgent == nil {
+		return nil, fmt.Errorf("initial agent %q not found", state.InitialAgentName)
+	}
+	return env, nil
+}
+
+func (env *AgentEnvironment) Save() error {
+	state := EnvironmentState{
+		Version: 1, ID: env.ID, Name: env.Name,
+		EmbeddingModel: env.MemoryStore.EmbeddingModel,
+		Agents:         make([]AgentState, 0, len(env.Agents)),
+	}
+	if env.InitialAgent != nil {
+		state.InitialAgentName = env.InitialAgent.Name
+	}
+	for _, agent := range env.Agents {
+		state.Agents = append(state.Agents, AgentState{
+			Name: agent.Name, ModelName: agent.ModelName, Instructions: agent.Instructions,
+			SessionID: agent.Session.SessionID, ToolNames: agent.ToolNames, Inbox: agent.Inbox,
+		})
+	}
+	if err := writeJSONAtomic(filepath.Join(env.DataRoot, "environment.json"), state); err != nil {
+		return fmt.Errorf("save environment: %w", err)
+	}
+	return nil
+}
+
+func (env *AgentEnvironment) Wait() {
+	env.MemoryStore.Wait()
+}
+
+func writeJSONAtomic(path string, value any) error {
+	data, err := json.MarshalIndent(value, "", "  ")
+	if err != nil {
+		return err
+	}
+	directory := filepath.Dir(path)
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return err
+	}
+	file, err := os.CreateTemp(directory, ".state-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(file.Name())
+	if _, err := file.Write(data); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		file.Close()
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(file.Name(), path)
+}

@@ -8,9 +8,9 @@ import (
 )
 
 type Session struct {
-	SessionID string
-	Messages  []Message
-	Scope     string
+	SessionID string    `json:"-"`
+	Messages  []Message `json:"messages"`
+	Scope     string    `json:"-"`
 }
 
 func (s *Session) persist() error {
@@ -20,17 +20,8 @@ func (s *Session) persist() error {
 		return fmt.Errorf("session ID must be a non-empty filename")
 	}
 
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode session: %w", err)
-	}
-
 	filename := filepath.Join(s.Scope, s.SessionID+".json")
-	if err := os.MkdirAll(filepath.Dir(filename), 0o700); err != nil {
-		return fmt.Errorf("create session directory: %w", err)
-	}
-
-	return os.WriteFile(filename, data, 0o600)
+	return writeJSONAtomic(filename, s)
 }
 
 func (s *Session) Load() error {
@@ -45,9 +36,11 @@ func (s *Session) Load() error {
 		return fmt.Errorf("read session file: %w", err)
 	}
 
-	if err := json.Unmarshal(data, s); err != nil {
+	var saved Session
+	if err := json.Unmarshal(data, &saved); err != nil {
 		return fmt.Errorf("decode session: %w", err)
 	}
+	s.Messages = saved.Messages
 
 	return nil
 }
@@ -55,7 +48,7 @@ func (s *Session) Load() error {
 func (s *Session) AddMessage(msg Message) error {
 	s.Messages = append(s.Messages, msg)
 	if err := s.persist(); err != nil {
-		fmt.Printf("failed to persist session: %v\n", err)
+		s.Messages = s.Messages[:len(s.Messages)-1]
 		return err
 	}
 	return nil

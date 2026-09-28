@@ -4,26 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
-
-type AgentEnvironment struct {
-	Agents       []*Agent
-	MemoryStore  *MemoryStore
-	InitialAgent *Agent
-	DataRoot     string
-	ID           string
-	Name         string
-}
-
-type AgentEnvironmentState struct {
-	ID             string   `json:"id"`
-	Name           string   `json:"name"`
-	EmbeddingModel string   `json:"embedding_model"`
-	Agents         []string `json:"agents"`
-}
 
 type Envelope struct {
 	ID             string
@@ -35,44 +18,65 @@ type Envelope struct {
 	ReplyTo        string
 }
 
-func NewAgentEnvironment(ctx context.Context, dataRoot string, name string) (*AgentEnvironment, error) {
-
-	fullDir := filepath.Join(dataRoot, name)
-
-	if err := os.MkdirAll(fullDir, 0755); err != nil {
-		return nil, fmt.Errorf("create data dir: %w", err)
-	}
-
-	store, err := LoadMemories(ctx, filepath.Join(fullDir, "memory.json"))
-	if err != nil {
-		return nil, fmt.Errorf("load memories: %w", err)
-	}
-	store.EmbeddingModel = "nomic-embed-text"
-
-	return &AgentEnvironment{
-		MemoryStore: store,
-		Agents:      []*Agent{},
-		DataRoot:    fullDir,
-		ID:          generateSessionID(),
-		Name:        name,
-	}, nil
-}
-
-func (env *AgentEnvironment) Wait() {
-	env.MemoryStore.Wait()
-}
-
 type Agent struct {
-	Client       ModelCall
-	Tools        []Tool
+	Client       ModelCall `json:"-"`
+	Tools        []Tool    `json:"-"`
+	ToolNames    []string
+	ModelName    string
 	Name         string
 	Instructions string
 	Session      Session
-	MemoryStore  *MemoryStore
 	Inbox        []Envelope
 }
 
-func (env *AgentEnvironment) CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name string, instructions string, sessionID string, initial bool) (*Agent, error) {
+func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, initial bool) (*Agent, error) {
+	if !validStateName.MatchString(name) {
+		return nil, fmt.Errorf("invalid agent name %q", name)
+	}
+	for _, existing := range env.Agents {
+		if existing.Name == name {
+			return nil, fmt.Errorf("agent %q already exists", name)
+		}
+	}
+	agent, err := env.createAgent(ctx, modelName, tools, name, instructions, "")
+	if err != nil {
+		return nil, err
+	}
+	previousInitial := env.InitialAgent
+	env.Agents = append(env.Agents, agent)
+	if initial {
+		env.InitialAgent = agent
+	}
+	if err := env.Save(); err != nil {
+		env.Agents = env.Agents[:len(env.Agents)-1]
+		env.InitialAgent = previousInitial
+		return nil, fmt.Errorf("save new agent: %w", err)
+	}
+	return agent, nil
+}
+
+func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, sessionID string) (*Agent, error) {
+	config, err := GetModelByName(modelName)
+	if err != nil {
+		return nil, err
+	}
+	client, err := NewModelClient(*config)
+	if err != nil {
+		return nil, err
+	}
+	builtins := MemoryTools(ctx, env.MemoryStore)
+	toolNames := make([]string, 0, len(tools))
+	seen := make(map[string]bool)
+	for _, tool := range builtins {
+		seen[tool.Name] = true
+	}
+	for _, tool := range tools {
+		if tool.Name == "" || tool.Execute == nil || seen[tool.Name] {
+			return nil, fmt.Errorf("invalid or duplicate tool %q", tool.Name)
+		}
+		seen[tool.Name] = true
+		toolNames = append(toolNames, tool.Name)
+	}
 
 	const defaultInstructions = `You are an assistant with access to tools and shared memory.
 	Use the available tools when needed to answer the user's request.
@@ -89,7 +93,7 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, client ModelCall, 
 		combinedInstructions += "\n\nAgent-specific instructions:\n" + instructions
 	}
 
-	tools = append(MemoryTools(ctx, env.MemoryStore), tools...)
+	tools = append(builtins, tools...)
 
 	session := Session{SessionID: sessionID, Scope: filepath.Join(env.DataRoot, "Sessions")}
 
@@ -105,16 +109,13 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, client ModelCall, 
 	agent := &Agent{
 		Client:       client,
 		Tools:        tools,
+		ToolNames:    toolNames,
+		ModelName:    modelName,
 		Name:         name,
-		Instructions: combinedInstructions,
+		Instructions: instructions,
 		Session:      session,
-		MemoryStore:  env.MemoryStore,
 	}
 
-	if initial {
-		env.InitialAgent = agent
-	}
-	env.Agents = append(env.Agents, agent)
 	return agent, nil
 }
 

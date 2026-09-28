@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -138,45 +139,41 @@ var callModelCmd = &cobra.Command{
 		modelName := args[0]
 		prompt := args[1]
 
-		model, err := api.GetModelByName(modelName)
-		if err != nil {
-			return fmt.Errorf("get model by name: %w", err)
-		}
-
-		client, err := api.NewModelClient(*model)
-		if err != nil {
-			return fmt.Errorf("create model client: %w", err)
-		}
-
-		tools := []api.Tool{
-			{
-				Name:        "get_time",
-				Description: "Get the current time in a specific location",
-				Parameters: []api.Parameter{
-					{
-						Name:        "location",
-						Type:        api.String,
-						Description: "The location to get the current time for",
-						Required:    true,
-					},
-				},
-				Execute: api.JSONHandler(func(ctx context.Context, arguments struct {
-					Location string `json:"location"`
-				}) (string, error) {
-					return fmt.Sprintf("Current time in %s: %s", arguments.Location, time.Now().Format(time.RFC3339)), nil
-				}),
-			},
-		}
-
+		registry := api.BuiltinTools()
 		env, err := api.NewAgentEnvironment(cmd.Context(), "./data", "cli-environment")
+		if errors.Is(err, os.ErrExist) {
+			env, err = api.LoadAgentEnvironment(cmd.Context(), "./data", "cli-environment", registry)
+		}
 		if err != nil {
-			return fmt.Errorf("create agent environment: %w", err)
+			return fmt.Errorf("open agent environment: %w", err)
 		}
 		defer env.Wait()
 
-		agent, err := env.CreateAgent(cmd.Context(), client, tools, "cli-agent", "Follow the instructions carefully.", "", true)
-		if err != nil {
-			return fmt.Errorf("create agent: %w", err)
+		var agent *api.Agent
+		for _, existing := range env.Agents {
+			if existing.Name == "cli-agent" {
+				agent = existing
+				break
+			}
+		}
+		if agent == nil {
+			agent, err = env.CreateAgent(cmd.Context(), modelName, []api.Tool{registry["get_time"]}, "cli-agent", "Follow the instructions carefully.", true)
+			if err != nil {
+				return fmt.Errorf("create agent: %w", err)
+			}
+		} else if agent.ModelName != modelName {
+			config, err := api.GetModelByName(modelName)
+			if err != nil {
+				return err
+			}
+			client, err := api.NewModelClient(*config)
+			if err != nil {
+				return err
+			}
+			agent.Client, agent.ModelName = client, modelName
+			if err := env.Save(); err != nil {
+				return err
+			}
 		}
 
 		response, err := agent.Execute(cmd.Context(), api.Message{Role: "user", Content: prompt})
