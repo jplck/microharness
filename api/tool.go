@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/shared"
@@ -55,4 +56,16 @@ func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {
 			"additionalProperties": false,
 		},
 	})
+}
+
+func JSONHandler[T any](
+	handler func(context.Context, T) (string, error),
+) func(context.Context, json.RawMessage) (string, error) {
+	return func(ctx context.Context, raw json.RawMessage) (string, error) {
+		var args T
+		if err := json.Unmarshal(raw, &args); err != nil {
+			return "", fmt.Errorf("invalid tool arguments: %w", err)
+		}
+		return handler(ctx, args)
+	}
 }

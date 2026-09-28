@@ -24,9 +24,8 @@ func CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name strin
 
 	if sessionID == "" {
 		session.SessionID = generateSessionID()
-		session.AddMessage(Message{Role: "system", Content: instructions})
-		if err := session.Persist(); err != nil {
-			return nil, fmt.Errorf("persist session: %w", err)
+		if err := session.AddMessage(Message{Role: "system", Content: instructions}); err != nil {
+			return nil, fmt.Errorf("add system message: %w", err)
 		}
 	} else if err := session.Load(); err != nil {
 		return nil, fmt.Errorf("load session: %w", err)
@@ -51,9 +50,8 @@ func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
 		tools[tool.Name] = tool
 	}
 
-	a.Session.AddMessage(input)
-	if err := a.Session.Persist(); err != nil {
-		return Message{}, fmt.Errorf("persist session: %w", err)
+	if err := a.Session.AddMessage(input); err != nil {
+		return Message{}, fmt.Errorf("add input message: %w", err)
 	}
 
 	for step := 0; step < 10; step++ {
@@ -63,7 +61,9 @@ func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
 			return Message{}, fmt.Errorf("call client: %w", err)
 		}
 
-		a.Session.AddMessage(resp)
+		if err := a.Session.AddMessage(resp); err != nil {
+			return Message{}, fmt.Errorf("add response message: %w", err)
+		}
 
 		if len(resp.ToolCalls) > 0 {
 			for _, call := range resp.ToolCalls {
@@ -71,7 +71,9 @@ func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
 					if toolOutput, err := tool.Execute(ctx, call.Arguments); err != nil {
 						return Message{}, fmt.Errorf("execute tool %s: %w", call.Name, err)
 					} else {
-						a.Session.AddMessage(Message{Role: "tool", Content: toolOutput, ToolCallID: call.ID})
+						if err := a.Session.AddMessage(Message{Role: "tool", Content: toolOutput, ToolCallID: call.ID}); err != nil {
+							return Message{}, fmt.Errorf("add tool output message: %w", err)
+						}
 					}
 				} else {
 					return Message{}, fmt.Errorf("tool %s not found", call.Name)
@@ -79,9 +81,6 @@ func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
 			}
 		}
 
-		if err := a.Session.Persist(); err != nil {
-			return Message{}, fmt.Errorf("persist session: %w", err)
-		}
 		if err := ctx.Err(); err != nil {
 			return Message{}, err
 		}

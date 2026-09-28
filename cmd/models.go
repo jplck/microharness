@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -67,15 +66,11 @@ var callModelCmd = &cobra.Command{
 						Required:    true,
 					},
 				},
-				Execute: func(ctx context.Context, arguments json.RawMessage) (string, error) {
-					var params struct {
-						Location string `json:"location"`
-					}
-					if err := json.Unmarshal(arguments, &params); err != nil {
-						return "", fmt.Errorf("invalid arguments: %w", err)
-					}
-					return fmt.Sprintf("Current time in %s: %s", params.Location, time.Now().Format(time.RFC3339)), nil
-				},
+				Execute: api.JSONHandler(func(ctx context.Context, arguments struct {
+					Location string `json:"location"`
+				}) (string, error) {
+					return fmt.Sprintf("Current time in %s: %s", arguments.Location, time.Now().Format(time.RFC3339)), nil
+				}),
 			},
 		}
 

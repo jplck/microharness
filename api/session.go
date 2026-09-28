@@ -13,7 +13,7 @@ type Session struct {
 	Scope     string
 }
 
-func (s *Session) Persist() error {
+func (s *Session) persist() error {
 
 	if s.SessionID == "" || s.SessionID == "." || s.SessionID == ".." ||
 		filepath.Base(s.SessionID) != s.SessionID {
@@ -52,6 +52,11 @@ func (s *Session) Load() error {
 	return nil
 }
 
-func (s *Session) AddMessage(msg Message) {
+func (s *Session) AddMessage(msg Message) error {
 	s.Messages = append(s.Messages, msg)
+	if err := s.persist(); err != nil {
+		fmt.Printf("failed to persist session: %v\n", err)
+		return err
+	}
+	return nil
 }
