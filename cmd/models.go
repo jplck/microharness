@@ -79,7 +79,7 @@ var callModelCmd = &cobra.Command{
 			},
 		}
 
-		agent, err := api.CreateAgent(cmd.Context(), client, tools, "cli-agent", "Follow the instructions carefully.", "OBGXQCKYQV7NTMI4BJBMEMMUUK")
+		agent, err := api.CreateAgent(cmd.Context(), client, tools, "cli-agent", "Follow the instructions carefully.", "")
 		if err != nil {
 			return fmt.Errorf("create agent: %w", err)
 		}

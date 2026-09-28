@@ -3,54 +3,8 @@ package api
 import (
 	"context"
 	"crypto/rand"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 )
-
-type Session struct {
-	SessionID string
-	Messages  []Message
-}
-
-func (s *Session) Persist() error {
-	if s.SessionID == "" ||
-		filepath.Base(s.SessionID) != s.SessionID {
-		return fmt.Errorf("session ID must be a non-empty filename")
-	}
-
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return fmt.Errorf("encode session: %w", err)
-	}
-
-	filename := s.SessionID + ".json"
-	return os.WriteFile(filename, data, 0o600)
-}
-
-func (s *Session) Load() error {
-	if s.SessionID == "" ||
-		filepath.Base(s.SessionID) != s.SessionID {
-		return fmt.Errorf("session ID must be a non-empty filename")
-	}
-
-	filename := s.SessionID + ".json"
-	data, err := os.ReadFile(filename)
-	if err != nil {
-		return fmt.Errorf("read session file: %w", err)
-	}
-
-	if err := json.Unmarshal(data, s); err != nil {
-		return fmt.Errorf("decode session: %w", err)
-	}
-
-	return nil
-}
-
-func (s *Session) AddMessage(msg Message) {
-	s.Messages = append(s.Messages, msg)
-}
 
 type AgentEnvironment struct {
 	Agents []Agent
@@ -66,18 +20,16 @@ type Agent struct {
 
 func CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name string, instructions string, sessionID string) (*Agent, error) {
 
-	var session Session
+	session := Session{SessionID: sessionID, Scope: "Sessions/"}
+
 	if sessionID == "" {
-		session = Session{SessionID: generateSessionID()}
+		session.SessionID = generateSessionID()
 		session.AddMessage(Message{Role: "system", Content: instructions})
 		if err := session.Persist(); err != nil {
 			return nil, fmt.Errorf("persist session: %w", err)
 		}
-	} else {
-		session = Session{SessionID: sessionID}
-		if err := session.Load(); err != nil {
-			return nil, fmt.Errorf("load session: %w", err)
-		}
+	} else if err := session.Load(); err != nil {
+		return nil, fmt.Errorf("load session: %w", err)
 	}
 
 	return &Agent{
