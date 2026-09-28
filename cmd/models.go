@@ -29,29 +29,22 @@ var listModelsCmd = &cobra.Command{
 		}
 
 		for _, model := range models {
-			fmt.Printf("Name: %s\n", model.Name)
-			fmt.Printf("Endpoint: %s\n", model.Endpoint)
-			fmt.Printf("Description: %s\n", model.Description)
-			fmt.Printf("Provider: %s\n", model.Provider)
-			fmt.Printf("API Key Env: %s\n", model.APIKeyEnv)
-			fmt.Println()
+			fmt.Printf("Name: %s\nEndpoint: %s\nDescription: %s\nProvider: %s\nAPI Key Env: %s\n\n",
+				model.Name, model.Endpoint, model.Description, model.Provider, model.APIKeyEnv)
 		}
 
 		return nil
 	},
 }
 
-var environmentSocket string
+var socketPath string
 
 var environmentCreateAgentCmd = &cobra.Command{
 	Use:   "create-agent <environment> <name> <model>",
 	Short: "Create an agent within an environment",
 	Args:  cobra.ExactArgs(3),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		instructions, err := cmd.Flags().GetString("instructions")
-		if err != nil {
-			return err
-		}
+		instructions, _ := cmd.Flags().GetString("instructions")
 		path := agentPath(args[0], args[1]) + "?" + url.Values{
 			"model":        []string{args[2]},
 			"instructions": []string{instructions},
@@ -122,7 +115,7 @@ func agentPath(environment, agent string) string {
 func runtimeRequest(cmd *cobra.Command, method, path string, body io.Reader) error {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", environmentSocket)
+			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
 		},
 	}
 	defer transport.CloseIdleConnections()
@@ -138,7 +131,7 @@ func runtimeRequest(cmd *cobra.Command, method, path string, body io.Reader) err
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("contact runtime at %s: %w", environmentSocket, err)
+		return fmt.Errorf("contact runtime at %s: %w", socketPath, err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= 300 {
@@ -159,23 +152,16 @@ var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Serve the API over a Unix socket",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		ctx, stop := signal.NotifyContext(
-			cmd.Context(),
-			os.Interrupt,
-			syscall.SIGTERM,
-		)
+		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-
-		return api.ServeRuntime(ctx, "/tmp/micro.sock", "./data")
+		return api.ServeRuntime(ctx, socketPath, "./data")
 	},
 }
 
 func init() {
+	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "/tmp/micro.sock", "Runtime Unix socket")
 	rootCmd.AddCommand(listModelsCmd)
 	rootCmd.AddCommand(serveCmd)
-	environmentCmd.PersistentFlags().StringVar(
-		&environmentSocket, "socket", "/tmp/micro.sock", "Runtime Unix socket",
-	)
 	environmentCreateAgentCmd.Flags().String("instructions", "", "Agent-specific instructions added to the default system prompt")
 	environmentCmd.AddCommand(environmentCreateCmd, environmentListCmd, environmentCreateAgentCmd)
 	environmentMessageCmd.Flags().String("sender", "cli", "External sender identity")

@@ -90,32 +90,13 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		w.WriteHeader(http.StatusAccepted)
 	})
 	mux.HandleFunc("POST /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request) {
+		env := lookupEnvironment(w, r)
+		if env == nil {
+			return
+		}
 		name := r.PathValue("name")
-		if !validStateName.MatchString(name) {
-			http.Error(w, "invalid agent name", http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		env, exists := environments[r.PathValue("id")]
-		if !exists {
-			http.Error(w, "environment not found", http.StatusNotFound)
-			return
-		}
-		if slices.ContainsFunc(env.Agents, func(agent *Agent) bool { return agent.Name == name }) {
-			http.Error(w, "agent already exists", http.StatusConflict)
-			return
-		}
-		config, err := GetModelByName(r.URL.Query().Get("model"))
-		if err != nil {
-			log.Printf("agent model lookup failed: %v", err)
-			http.Error(w, "cannot resolve model", http.StatusBadRequest)
-			return
-		}
-		_, err = env.CreateAgent(ctx, config.Name, nil, name, r.URL.Query().Get("instructions"), env.InitialAgent == nil)
-		if err != nil {
-			log.Printf("agent creation failed: name=%s error=%v", name, err)
-			http.Error(w, "cannot create agent", http.StatusInternalServerError)
+		if _, err := env.CreateAgent(ctx, r.URL.Query().Get("model"), nil, name, r.URL.Query().Get("instructions"), false); err != nil {
+			writeMessagingError(w, err)
 			return
 		}
 		log.Printf("agent created: environment=%s name=%s", r.PathValue("id"), name)
@@ -215,7 +196,9 @@ func writeMessagingError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrAgentNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
-	case errors.Is(err, ErrInvalidEnvelope):
+	case errors.Is(err, ErrAgentExists):
+		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, ErrEnvironmentClosed), errors.Is(err, context.Canceled):
 		http.Error(w, "environment is stopping", http.StatusServiceUnavailable)

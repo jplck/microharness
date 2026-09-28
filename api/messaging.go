@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,8 @@ import (
 )
 
 var ErrAgentNotFound = errors.New("agent not found")
+var ErrAgentExists = errors.New("agent already exists")
+var ErrInvalidName = errors.New("invalid name")
 var ErrInvalidEnvelope = errors.New("invalid envelope")
 var ErrEnvironmentClosed = errors.New("environment is closed")
 
@@ -56,7 +59,7 @@ func (env *AgentEnvironment) Message(ctx context.Context, envelope Envelope) (st
 		return "", fmt.Errorf("%w: recipient %q", ErrAgentNotFound, envelope.To)
 	}
 	if envelope.ID == "" {
-		envelope.ID = generateSessionID()
+		envelope.ID = rand.Text()
 	}
 	if envelope.ConversationID == "" {
 		envelope.ConversationID = envelope.ID

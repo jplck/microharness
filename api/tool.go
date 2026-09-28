@@ -29,7 +29,7 @@ type Tool struct {
 	Name        string
 	Description string
 	Parameters  []Parameter
-	Execute     func(context.Context, json.RawMessage) (string, error) `json:"-"`
+	Execute     func(context.Context, json.RawMessage) (string, error)
 }
 
 func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {

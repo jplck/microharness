@@ -48,7 +48,7 @@ func TestEnvironmentRoundTrip(t *testing.T) {
 	if err := env.MemoryStore.Add(ctx, Memory{Kind: "fact", Content: "Saved memory"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := env.Save(); err != nil {
+	if err := env.saveLocked(); err != nil {
 		t.Fatal(err)
 	}
 	loaded, err := LoadAgentEnvironment(ctx, root, "test", registry)
@@ -151,7 +151,7 @@ func TestEnvironmentRejectsInvalidState(t *testing.T) {
 		{"duplicate agent", func(state *EnvironmentState) { state.Agents = append(state.Agents, state.Agents[0]) }, "duplicate agent"},
 		{"missing tool", func(state *EnvironmentState) { state.Agents[0].ToolNames = []string{"missing"} }, "requires registered tool"},
 		{"duplicate tool", func(state *EnvironmentState) { state.Agents[0].ToolNames = []string{"echo", "echo"} }, "duplicate tool"},
-		{"missing model", func(state *EnvironmentState) { state.Agents[0].ModelName = "missing" }, "model \"missing\" not found"},
+		{"missing model", func(state *EnvironmentState) { state.Agents[0].ModelName = "missing" }, "model not found: \"missing\""},
 		{"empty session", func(state *EnvironmentState) { state.Agents[0].SessionID = "" }, "invalid or duplicate agent"},
 		{"session traversal", func(state *EnvironmentState) { state.Agents[0].SessionID = "../outside" }, "session ID"},
 	}

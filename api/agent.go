@@ -23,8 +23,8 @@ type Envelope struct {
 type Agent struct {
 	runMu        sync.Mutex
 	inboxWake    chan struct{}
-	Client       ModelCall `json:"-"`
-	Tools        []Tool    `json:"-"`
+	Client       ModelCall
+	Tools        []Tool
 	ToolNames    []string
 	ModelName    string
 	Name         string
@@ -44,11 +44,11 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, 
 		return nil, err
 	}
 	if !validStateName.MatchString(name) {
-		return nil, fmt.Errorf("invalid agent name %q", name)
+		return nil, fmt.Errorf("%w %q", ErrInvalidName, name)
 	}
 	for _, existing := range env.Agents {
 		if existing.Name == name {
-			return nil, fmt.Errorf("agent %q already exists", name)
+			return nil, fmt.Errorf("%w: %q", ErrAgentExists, name)
 		}
 	}
 	agent, err := env.createAgent(ctx, modelName, tools, name, instructions, "")
@@ -57,7 +57,7 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, 
 	}
 	previousInitial := env.InitialAgent
 	env.Agents = append(env.Agents, agent)
-	if initial {
+	if initial || env.InitialAgent == nil {
 		env.InitialAgent = agent
 	}
 	if err := env.saveLocked(); err != nil {
@@ -115,7 +115,7 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 	session := Session{SessionID: sessionID, Scope: filepath.Join(env.DataRoot, "Sessions")}
 
 	if sessionID == "" {
-		session.SessionID = generateSessionID()
+		session.SessionID = rand.Text()
 		if err := session.AddMessage(Message{Role: "system", Content: combinedInstructions}); err != nil {
 			return nil, fmt.Errorf("add system message: %w", err)
 		}
@@ -134,10 +134,6 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 	}
 
 	return agent, nil
-}
-
-func generateSessionID() string {
-	return rand.Text()
 }
 
 func (a *Agent) executeEnvelope(ctx context.Context, envelope Envelope) error {

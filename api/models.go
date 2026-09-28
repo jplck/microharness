@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -20,20 +21,7 @@ const (
 	ProviderAzure  Provider = "azure"
 )
 
-func (provider *Provider) UnmarshalJSON(data []byte) error {
-	var value string
-	if err := json.Unmarshal(data, &value); err != nil {
-		return err
-	}
-
-	switch Provider(value) {
-	case ProviderOpenAI, ProviderAzure:
-		*provider = Provider(value)
-		return nil
-	default:
-		return fmt.Errorf("unsupported provider %q", value)
-	}
-}
+var ErrModelNotFound = errors.New("model not found")
 
 type Model struct {
 	Name        string   `json:"name"`
@@ -59,15 +47,8 @@ func ListModels() ([]Model, error) {
 	}
 
 	for index := range result.Models {
-		model := &result.Models[index]
-
-		if model.APIKeyEnv == "" {
-			continue
-		}
-
-		apiKey, ok := os.LookupEnv(model.APIKeyEnv)
-		if ok {
-			model.APIKey = apiKey
+		if env := result.Models[index].APIKeyEnv; env != "" {
+			result.Models[index].APIKey = os.Getenv(env)
 		}
 	}
 
@@ -118,5 +99,5 @@ func GetModelByName(name string) (*Model, error) {
 		}
 	}
 
-	return nil, fmt.Errorf("model %q not found", name)
+	return nil, fmt.Errorf("%w: %q", ErrModelNotFound, name)
 }

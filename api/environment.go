@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,9 +66,9 @@ func NewAgentEnvironment(ctx context.Context, dataRoot, name string) (*AgentEnvi
 	store.EmbeddingModel = "nomic-embed-text"
 	env := &AgentEnvironment{
 		Agents: []*Agent{}, MemoryStore: store, DataRoot: directory,
-		ID: generateSessionID(), Name: name,
+		ID: rand.Text(), Name: name,
 	}
-	if err := env.Save(); err != nil {
+	if err := env.saveLocked(); err != nil {
 		return nil, err
 	}
 	return env, nil
@@ -130,12 +131,6 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 		return nil, fmt.Errorf("initial agent %q not found", state.InitialAgentName)
 	}
 	return env, nil
-}
-
-func (env *AgentEnvironment) Save() error {
-	env.mu.Lock()
-	defer env.mu.Unlock()
-	return env.saveLocked()
 }
 
 func (env *AgentEnvironment) saveLocked() error {
