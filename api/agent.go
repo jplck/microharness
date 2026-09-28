@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -11,10 +13,37 @@ type AgentEnvironment struct {
 	Agents       []*Agent
 	MemoryStore  *MemoryStore
 	InitialAgent *Agent
+	DataRoot     string
+	ID           string
+	Name         string
 }
 
-func NewAgentEnvironment(ctx context.Context) (*AgentEnvironment, error) {
-	store, err := LoadMemories(ctx, "memory.json")
+type AgentEnvironmentState struct {
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	EmbeddingModel string   `json:"embedding_model"`
+	Agents         []string `json:"agents"`
+}
+
+type Envelope struct {
+	ID             string
+	Source         string
+	Sender         string
+	To             string
+	ConversationID string
+	Content        string
+	ReplyTo        string
+}
+
+func NewAgentEnvironment(ctx context.Context, dataRoot string, name string) (*AgentEnvironment, error) {
+
+	fullDir := filepath.Join(dataRoot, name)
+
+	if err := os.MkdirAll(fullDir, 0755); err != nil {
+		return nil, fmt.Errorf("create data dir: %w", err)
+	}
+
+	store, err := LoadMemories(ctx, filepath.Join(fullDir, "memory.json"))
 	if err != nil {
 		return nil, fmt.Errorf("load memories: %w", err)
 	}
@@ -23,6 +52,9 @@ func NewAgentEnvironment(ctx context.Context) (*AgentEnvironment, error) {
 	return &AgentEnvironment{
 		MemoryStore: store,
 		Agents:      []*Agent{},
+		DataRoot:    fullDir,
+		ID:          generateSessionID(),
+		Name:        name,
 	}, nil
 }
 
@@ -37,6 +69,7 @@ type Agent struct {
 	Instructions string
 	Session      Session
 	MemoryStore  *MemoryStore
+	Inbox        []Envelope
 }
 
 func (env *AgentEnvironment) CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name string, instructions string, sessionID string, initial bool) (*Agent, error) {
@@ -58,7 +91,7 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, client ModelCall, 
 
 	tools = append(MemoryTools(ctx, env.MemoryStore), tools...)
 
-	session := Session{SessionID: sessionID, Scope: "Sessions/"}
+	session := Session{SessionID: sessionID, Scope: filepath.Join(env.DataRoot, "Sessions")}
 
 	if sessionID == "" {
 		session.SessionID = generateSessionID()

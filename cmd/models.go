@@ -3,6 +3,13 @@ package cmd
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/signal"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -30,6 +37,93 @@ var listModelsCmd = &cobra.Command{
 		}
 
 		return nil
+	},
+}
+
+var environmentSocket string
+
+var environmentCreateAgentCmd = &cobra.Command{
+	Use:   "create-agent <environment> <name> <model>",
+	Short: "Create an agent within an environment",
+	Args:  cobra.ExactArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		path := "/environments/" + url.PathEscape(args[0]) +
+			"/agents/" + url.PathEscape(args[1]) +
+			"?" + url.Values{"model": []string{args[2]}}.Encode()
+		return runtimeRequest(cmd, http.MethodPost, path)
+	},
+}
+
+var environmentCmd = &cobra.Command{
+	Use:   "environment",
+	Short: "Manage environments in the running service",
+}
+
+var environmentCreateCmd = &cobra.Command{
+	Use:   "create <id>",
+	Short: "Create an environment",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runtimeRequest(cmd, http.MethodPost,
+			"/environments/"+url.PathEscape(args[0]))
+	},
+}
+
+var environmentListCmd = &cobra.Command{
+	Use:   "list",
+	Short: "List active environments",
+	Args:  cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runtimeRequest(cmd, http.MethodGet, "/environments")
+	},
+}
+
+func runtimeRequest(cmd *cobra.Command, method, path string) error {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", environmentSocket)
+		},
+	}
+	defer transport.CloseIdleConnections()
+	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
+	request, err := http.NewRequestWithContext(
+		cmd.Context(), method, "http://localhost"+path, nil,
+	)
+	if err != nil {
+		return err
+	}
+	response, err := client.Do(request)
+	if err != nil {
+		return fmt.Errorf("contact runtime at %s: %w", environmentSocket, err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode >= 300 {
+		body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
+		if err != nil {
+			return fmt.Errorf("runtime returned %s; read response: %w", response.Status, err)
+		}
+		return fmt.Errorf("runtime returned %s: %s", response.Status, body)
+	}
+	if method == http.MethodPost {
+		cmd.Println("Environment created.")
+		return nil
+	}
+	_, err = io.Copy(cmd.OutOrStdout(), response.Body)
+	return err
+}
+
+var serveCmd = &cobra.Command{
+	Use:   "serve",
+	Short: "Serve the API over a Unix socket",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		ctx, stop := signal.NotifyContext(
+			cmd.Context(),
+			os.Interrupt,
+			syscall.SIGTERM,
+		)
+		defer stop()
+
+		return api.ServeRuntime(ctx, "/tmp/micro.sock", "./data")
 	},
 }
 
@@ -74,7 +168,7 @@ var callModelCmd = &cobra.Command{
 			},
 		}
 
-		env, err := api.NewAgentEnvironment(cmd.Context())
+		env, err := api.NewAgentEnvironment(cmd.Context(), "./data", "cli-environment")
 		if err != nil {
 			return fmt.Errorf("create agent environment: %w", err)
 		}
@@ -97,4 +191,10 @@ var callModelCmd = &cobra.Command{
 func init() {
 	rootCmd.AddCommand(listModelsCmd)
 	rootCmd.AddCommand(callModelCmd)
+	rootCmd.AddCommand(serveCmd)
+	environmentCmd.PersistentFlags().StringVar(
+		&environmentSocket, "socket", "/tmp/micro.sock", "Runtime Unix socket",
+	)
+	environmentCmd.AddCommand(environmentCreateCmd, environmentListCmd, environmentCreateAgentCmd)
+	rootCmd.AddCommand(environmentCmd)
 }
