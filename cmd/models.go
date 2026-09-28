@@ -74,7 +74,13 @@ var callModelCmd = &cobra.Command{
 			},
 		}
 
-		agent, err := api.CreateAgent(cmd.Context(), client, tools, "cli-agent", "Follow the instructions carefully.", "")
+		env, err := api.NewAgentEnvironment(cmd.Context())
+		if err != nil {
+			return fmt.Errorf("create agent environment: %w", err)
+		}
+		defer env.Wait()
+
+		agent, err := env.CreateAgent(cmd.Context(), client, tools, "cli-agent", "Follow the instructions carefully.", "", true)
 		if err != nil {
 			return fmt.Errorf("create agent: %w", err)
 		}

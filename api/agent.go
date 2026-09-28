@@ -7,7 +7,26 @@ import (
 )
 
 type AgentEnvironment struct {
-	Agents []Agent
+	Agents       []*Agent
+	MemoryStore  *MemoryStore
+	InitialAgent *Agent
+}
+
+func NewAgentEnvironment(ctx context.Context) (*AgentEnvironment, error) {
+	store, err := LoadMemories(ctx, "memory.json")
+	if err != nil {
+		return nil, fmt.Errorf("load memories: %w", err)
+	}
+	store.EmbeddingModel = "nomic-embed-text"
+
+	return &AgentEnvironment{
+		MemoryStore: store,
+		Agents:      []*Agent{},
+	}, nil
+}
+
+func (env *AgentEnvironment) Wait() {
+	env.MemoryStore.Wait()
 }
 
 type Agent struct {
@@ -19,10 +38,9 @@ type Agent struct {
 	MemoryStore  *MemoryStore
 }
 
-func CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name string, instructions string, sessionID string) (*Agent, error) {
+func (env *AgentEnvironment) CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name string, instructions string, sessionID string, initial bool) (*Agent, error) {
 
-	memoryStore := MemoryStore{Path: "memory.json", EmbeddingModel: "nomic-embed-text"}
-	tools = append(MemoryTools(ctx, &memoryStore), tools...)
+	tools = append(MemoryTools(ctx, env.MemoryStore), tools...)
 
 	session := Session{SessionID: sessionID, Scope: "Sessions/"}
 
@@ -35,14 +53,20 @@ func CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name strin
 		return nil, fmt.Errorf("load session: %w", err)
 	}
 
-	return &Agent{
+	agent := &Agent{
 		Client:       client,
 		Tools:        tools,
 		Name:         name,
 		Instructions: instructions,
 		Session:      session,
-		MemoryStore:  &memoryStore,
-	}, nil
+		MemoryStore:  env.MemoryStore,
+	}
+
+	if initial {
+		env.InitialAgent = agent
+	}
+	env.Agents = append(env.Agents, agent)
+	return agent, nil
 }
 
 func generateSessionID() string {
