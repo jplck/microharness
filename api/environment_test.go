@@ -189,53 +189,35 @@ func TestEnvironmentRejectsInvalidState(t *testing.T) {
 	}
 }
 
-func TestEnvironmentLegacyAndRelocation(t *testing.T) {
+func TestEnvironmentRelocation(t *testing.T) {
 	ctx, root, registry := setupPersistenceTest(t)
-	filename := filepath.Join(root, "legacy", "environment.json")
-	legacy := map[string]any{
-		"ID": "original-id", "Name": "legacy", "Agents": []any{},
-		"MemoryStore": map[string]string{"Path": "/old/memory.json", "EmbeddingModel": "legacy-embedding"},
-	}
-	if err := writeJSONAtomic(filename, legacy); err != nil {
-		t.Fatal(err)
-	}
-	env, err := LoadAgentEnvironment(ctx, root, "legacy", registry)
+	env, err := NewAgentEnvironment(ctx, root, "moved")
 	if err != nil {
 		t.Fatal(err)
-	}
-	if env.ID != "original-id" || env.MemoryStore.EmbeddingModel != "legacy-embedding" {
-		t.Fatal("legacy metadata lost")
 	}
 	agent, err := env.CreateAgent(ctx, "test-model", nil, "assistant", "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	legacySession := map[string]any{
-		"SessionID": "wrong-id", "Scope": "/old/Sessions",
-		"Messages": []Message{{Role: "system", Content: "Preserve the original system prompt"}},
-	}
-	if err := writeJSONAtomic(filepath.Join(agent.Session.Scope, agent.Session.SessionID+".json"), legacySession); err != nil {
-		t.Fatal(err)
-	}
 	newRoot := t.TempDir()
-	if err := os.Rename(env.DataRoot, filepath.Join(newRoot, "legacy")); err != nil {
+	if err := os.Rename(env.DataRoot, filepath.Join(newRoot, "moved")); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := LoadAgentEnvironment(ctx, newRoot, "legacy", registry)
+	loaded, err := LoadAgentEnvironment(ctx, newRoot, "moved", registry)
 	if err != nil {
 		t.Fatal(err)
 	}
 	session := &loaded.InitialAgent.Session
-	if session.SessionID != agent.Session.SessionID || session.Scope != filepath.Join(newRoot, "legacy", "Sessions") {
-		t.Fatal("legacy session overwrote its runtime identity or path")
+	if session.SessionID != agent.Session.SessionID || session.Scope != filepath.Join(newRoot, "moved", "Sessions") {
+		t.Fatal("session identity or path was not rebased")
 	}
-	if len(session.Messages) != 1 || session.Messages[0].Content != "Preserve the original system prompt" {
-		t.Fatal("legacy messages were not preserved")
+	if len(session.Messages) != 1 || session.Messages[0].Role != "system" {
+		t.Fatal("session messages were not preserved")
 	}
 	if err := session.AddMessage(Message{Role: "user", Content: "After relocation"}); err != nil {
 		t.Fatal(err)
 	}
-	if loaded.MemoryStore.Path != filepath.Join(newRoot, "legacy", "memory.json") {
+	if loaded.MemoryStore.Path != filepath.Join(newRoot, "moved", "memory.json") {
 		t.Fatal("memory path was not rebased")
 	}
 }

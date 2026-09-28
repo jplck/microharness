@@ -34,7 +34,6 @@ var listModelsCmd = &cobra.Command{
 			fmt.Printf("Description: %s\n", model.Description)
 			fmt.Printf("Provider: %s\n", model.Provider)
 			fmt.Printf("API Key Env: %s\n", model.APIKeyEnv)
-			fmt.Printf("API Key: %s\n", model.APIKey)
 			fmt.Println()
 		}
 
@@ -53,9 +52,7 @@ var environmentCreateAgentCmd = &cobra.Command{
 		if err != nil {
 			return err
 		}
-		path := "/environments/" + url.PathEscape(args[0]) +
-			"/agents/" + url.PathEscape(args[1]) +
-			"?" + url.Values{
+		path := agentPath(args[0], args[1]) + "?" + url.Values{
 			"model":        []string{args[2]},
 			"instructions": []string{instructions},
 		}.Encode()
@@ -107,15 +104,19 @@ var environmentMessageCmd = &cobra.Command{
 var environmentInboxCmd = &cobra.Command{
 	Use: "inbox <environment> <agent>", Short: "Show pending messages and inbox errors", Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runtimeRequest(cmd, http.MethodGet, "/environments/"+url.PathEscape(args[0])+"/agents/"+url.PathEscape(args[1])+"/inbox", nil)
+		return runtimeRequest(cmd, http.MethodGet, agentPath(args[0], args[1])+"/inbox", nil)
 	},
 }
 
 var environmentRetryInboxCmd = &cobra.Command{
 	Use: "retry-inbox <environment> <agent>", Short: "Resume a paused agent inbox", Args: cobra.ExactArgs(2),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runtimeRequest(cmd, http.MethodPost, "/environments/"+url.PathEscape(args[0])+"/agents/"+url.PathEscape(args[1])+"/inbox/retry", nil)
+		return runtimeRequest(cmd, http.MethodPost, agentPath(args[0], args[1])+"/inbox/retry", nil)
 	},
+}
+
+func agentPath(environment, agent string) string {
+	return "/environments/" + url.PathEscape(environment) + "/agents/" + url.PathEscape(agent)
 }
 
 func runtimeRequest(cmd *cobra.Command, method, path string, body io.Reader) error {

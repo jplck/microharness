@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/openai/openai-go/v3"
@@ -43,11 +42,6 @@ type Model struct {
 	Provider    Provider `json:"provider"`
 	APIKeyEnv   string   `json:"apiKeyEnv,omitempty"`
 	APIKey      string   `json:"-"`
-}
-
-type Authentication struct {
-	APIKey          string
-	TokenCredential azcore.TokenCredential
 }
 
 func ListModels() ([]Model, error) {

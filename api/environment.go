@@ -86,19 +86,6 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, fmt.Errorf("decode environment: %w", err)
 	}
-	if state.Version == 0 {
-		var legacy struct {
-			MemoryStore *struct{ EmbeddingModel string }
-		}
-		if err := json.Unmarshal(data, &legacy); err != nil {
-			return nil, fmt.Errorf("decode legacy environment: %w", err)
-		}
-		if legacy.MemoryStore == nil || len(state.Agents) != 0 {
-			return nil, fmt.Errorf("legacy environment %q cannot be restored: agent model names were not persisted", name)
-		}
-		state.Version = 1
-		state.EmbeddingModel = legacy.MemoryStore.EmbeddingModel
-	}
 	if state.Version != 1 {
 		return nil, fmt.Errorf("unsupported environment version %d", state.Version)
 	}

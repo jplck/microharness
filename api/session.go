@@ -13,24 +13,27 @@ type Session struct {
 	Scope     string    `json:"-"`
 }
 
-func (s *Session) persist() error {
-
+func (s *Session) path() (string, error) {
 	if s.SessionID == "" || s.SessionID == "." || s.SessionID == ".." ||
 		filepath.Base(s.SessionID) != s.SessionID {
-		return fmt.Errorf("session ID must be a non-empty filename")
+		return "", fmt.Errorf("session ID must be a non-empty filename")
 	}
+	return filepath.Join(s.Scope, s.SessionID+".json"), nil
+}
 
-	filename := filepath.Join(s.Scope, s.SessionID+".json")
+func (s *Session) persist() error {
+	filename, err := s.path()
+	if err != nil {
+		return err
+	}
 	return writeJSONAtomic(filename, s)
 }
 
 func (s *Session) Load() error {
-	if s.SessionID == "" || s.SessionID == "." || s.SessionID == ".." ||
-		filepath.Base(s.SessionID) != s.SessionID {
-		return fmt.Errorf("session ID must be a non-empty filename")
+	filename, err := s.path()
+	if err != nil {
+		return err
 	}
-
-	filename := filepath.Join(s.Scope, s.SessionID+".json")
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return fmt.Errorf("read session file: %w", err)
