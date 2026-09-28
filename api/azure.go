@@ -50,3 +50,39 @@ func (model *AzureModel) Call(ctx context.Context, messages []Message, tools []T
 	}
 	return client.Call(ctx, messages, tools)
 }
+
+func (model *AzureModel) Embed(ctx context.Context, input string) ([]float64, error) {
+	config := model.Config
+	var authOption option.RequestOption
+	if config.APIKeyEnv != "" || config.APIKey != "" {
+		if config.APIKey == "" {
+			return nil, fmt.Errorf(
+				"API key is missing or empty for model %q",
+				config.Name,
+			)
+		}
+		authOption = option.WithAPIKey(config.APIKey)
+	} else {
+		credential, err := azidentity.NewDefaultAzureCredential(nil)
+		if err != nil {
+			return nil, fmt.Errorf("create Azure credential: %w", err)
+		}
+		token, err := credential.GetToken(ctx, policy.TokenRequestOptions{
+			Scopes: []string{"https://cognitiveservices.azure.com/.default"},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("get Azure token: %w", err)
+		}
+		authOption = option.WithAPIKey(token.Token)
+	}
+
+	client := &OpenAIChatModel{
+		Config: model.Config,
+		Client: openai.NewClient(
+			option.WithBaseURL(model.Config.Endpoint),
+			authOption,
+			option.WithMaxRetries(0),
+		),
+	}
+	return client.Embed(ctx, input)
+}

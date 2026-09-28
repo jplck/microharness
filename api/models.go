@@ -77,6 +77,7 @@ func ListModels() ([]Model, error) {
 
 type ModelCall interface {
 	Call(ctx context.Context, messages []Message, tools []Tool) (Message, error)
+	Embed(ctx context.Context, input string) ([]float64, error)
 }
 
 func NewModelClient(config Model) (ModelCall, error) {

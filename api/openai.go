@@ -22,3 +22,15 @@ func (model *OpenAIModel) Call(ctx context.Context, messages []Message, tools []
 	}
 	return client.Call(ctx, messages, tools)
 }
+
+func (model *OpenAIModel) Embed(ctx context.Context, input string) ([]float64, error) {
+	client := &OpenAIChatModel{
+		Config: model.Config,
+		Client: openai.NewClient(
+			option.WithBaseURL(model.Config.Endpoint),
+			option.WithAPIKey(model.Config.APIKey),
+			option.WithMaxRetries(0),
+		),
+	}
+	return client.Embed(ctx, input)
+}

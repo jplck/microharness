@@ -1,8 +1,10 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,17 +12,20 @@ import (
 )
 
 type Memory struct {
-	ID        string    `json:"id"`
-	Kind      string    `json:"kind"`
-	Content   string    `json:"content"`
-	SessionID string    `json:"session_id,omitempty"`
-	Approved  bool      `json:"approved,omitempty"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID             string    `json:"id"`
+	Kind           string    `json:"kind"`
+	Content        string    `json:"content"`
+	SessionID      string    `json:"session_id,omitempty"`
+	Approved       bool      `json:"approved,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	EmbeddingModel string    `json:"embedding_model,omitempty"`
+	Embedding      []float64 `json:"embedding,omitempty"`
 }
 
 type MemoryStore struct {
-	Path    string
-	Entries []Memory
+	Path           string
+	Entries        []Memory
+	EmbeddingModel string
 }
 
 func LoadMemories(path string) (*MemoryStore, error) {
@@ -63,6 +68,26 @@ func (store *MemoryStore) save() error {
 }
 
 func (store *MemoryStore) Add(memory Memory) error {
+
+	if store.EmbeddingModel != "" {
+		model, err := GetModelByName(store.EmbeddingModel)
+		if err != nil {
+			return fmt.Errorf("get model by name: %w", err)
+		}
+
+		client, err := NewModelClient(*model)
+		if err != nil {
+			return fmt.Errorf("create model client: %w", err)
+		}
+
+		embedding, err := client.Embed(context.Background(), memory.Content)
+		if err != nil {
+			return fmt.Errorf("embed memory content: %w", err)
+		}
+		memory.Embedding = embedding
+		memory.EmbeddingModel = store.EmbeddingModel
+	}
+
 	memory.UpdatedAt = time.Now()
 	store.Entries = append(store.Entries, memory)
 	if err := store.save(); err != nil {

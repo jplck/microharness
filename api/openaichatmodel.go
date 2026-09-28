@@ -27,6 +27,23 @@ type ToolCall struct {
 	Arguments json.RawMessage
 }
 
+func (model *OpenAIChatModel) Embed(ctx context.Context, input string) ([]float64, error) {
+	result, err := model.Client.Embeddings.New(ctx, openai.EmbeddingNewParams{
+		Model: model.Config.Name,
+		Input: openai.EmbeddingNewParamsInputUnion{
+			OfString: openai.String(input),
+		},
+		EncodingFormat: openai.EmbeddingNewParamsEncodingFormatFloat,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("create embedding: %w", err)
+	}
+	if len(result.Data) == 0 || len(result.Data[0].Embedding) == 0 {
+		return nil, fmt.Errorf("no embedding returned")
+	}
+	return result.Data[0].Embedding, nil
+}
+
 func (model *OpenAIChatModel) Call(ctx context.Context, messages []Message, tools []Tool) (Message, error) {
 	if model.Config.Endpoint == "" {
 		return Message{}, fmt.Errorf("endpoint is required")

@@ -1,0 +1,20 @@
+{
+  "models": [
+    {
+      "name": "nomic-embed-text",
+      "endpoint": "http://localhost:11434/v1/",
+      "provider": "openai"
+    },
+    {
+      "name": "your-chat-deployment",
+      "endpoint": "https://YOUR-RESOURCE.openai.azure.com/openai/v1/",
+      "provider": "azure"
+    },
+    {
+      "name": "your-key-auth-deployment",
+      "endpoint": "https://YOUR-RESOURCE.openai.azure.com/openai/v1/",
+      "provider": "azure",
+      "apiKeyEnv": "AZURE_OPENAI_API_KEY"
+    }
+  ]
+}

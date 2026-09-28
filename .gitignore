@@ -7,3 +7,6 @@
 .env
 .env.*
 !.env.example
+memory.json
+Sessions
+models.json
