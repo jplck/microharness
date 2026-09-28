@@ -112,6 +112,17 @@ func TestEnvironmentRoundTrip(t *testing.T) {
 	if len(loaded.MemoryStore.entries) != 2 || len(env.MemoryStore.entries) != 1 {
 		t.Fatal("memory tools were not bound to the restored store")
 	}
+	for _, tool := range restored.Tools {
+		if tool.Name == "update_memory" {
+			arguments, _ := json.Marshal(map[string]string{"id": loaded.MemoryStore.entries[1].ID, "kind": "fact", "content": "Updated tool memory"})
+			if _, err := tool.Execute(ctx, arguments); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if updated := loaded.MemoryStore.entries[1]; updated.Content != "Updated tool memory" || updated.Revision != 2 {
+		t.Fatalf("update_memory did not apply: %+v", updated)
+	}
 }
 
 func TestEnvironmentRejectsInvalidState(t *testing.T) {

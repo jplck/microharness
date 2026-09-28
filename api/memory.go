@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -65,27 +64,14 @@ func LoadMemories(appCtx context.Context, path string) (*MemoryStore, error) {
 }
 
 func (store *MemoryStore) save() error {
-	data, err := json.MarshalIndent(store.entries, "", "  ")
-	if err != nil {
-		return err
+	return writeJSONAtomic(store.Path, store.entries)
+}
+
+func validKind(kind string) error {
+	if kind != "fact" && kind != "episode" && kind != "procedure" {
+		return fmt.Errorf("kind must be fact, episode, or procedure")
 	}
-	directory := filepath.Dir(store.Path)
-	if err := os.MkdirAll(directory, 0o700); err != nil {
-		return err
-	}
-	file, err := os.CreateTemp(directory, ".memory-*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(file.Name())
-	if _, err := file.Write(data); err != nil {
-		file.Close()
-		return err
-	}
-	if err := file.Close(); err != nil {
-		return err
-	}
-	return os.Rename(file.Name(), store.Path)
+	return nil
 }
 
 func (store *MemoryStore) queueEmbedding(appCtx context.Context, memory Memory) {
@@ -160,10 +146,8 @@ func (store *MemoryStore) update(ctx context.Context, changes Memory) (Memory, e
 	if changes.ID == "" || strings.TrimSpace(changes.Content) == "" {
 		return Memory{}, fmt.Errorf("ID and content are required")
 	}
-	switch changes.Kind {
-	case "fact", "episode", "procedure":
-	default:
-		return Memory{}, fmt.Errorf("kind must be fact, episode, or procedure")
+	if err := validKind(changes.Kind); err != nil {
+		return Memory{}, err
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -175,9 +159,6 @@ func (store *MemoryStore) update(ctx context.Context, changes Memory) (Memory, e
 		return Memory{}, fmt.Errorf("memory %q not found", changes.ID)
 	}
 	previous := store.entries[index]
-	if previous.Revision != changes.Revision {
-		return Memory{}, fmt.Errorf("memory %q has changed; reload before updating", changes.ID)
-	}
 
 	next := previous
 	next.Kind, next.Content, next.Approved = changes.Kind, changes.Content, changes.Approved
@@ -245,6 +226,9 @@ func (store *MemoryStore) Add(ctx context.Context, memory Memory) error {
 }
 
 func (store *MemoryStore) add(ctx context.Context, memory Memory) (Memory, error) {
+	if err := validKind(memory.Kind); err != nil {
+		return Memory{}, err
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 
