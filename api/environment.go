@@ -173,10 +173,6 @@ func (env *AgentEnvironment) saveLocked() error {
 	return nil
 }
 
-func (env *AgentEnvironment) Wait() {
-	env.MemoryStore.Wait()
-}
-
 func writeJSONAtomic(path string, value any) error {
 	data, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {

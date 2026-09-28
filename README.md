@@ -53,9 +53,7 @@ This is not an exactly-once guarantee: a crash after a tool side effect but befo
 its result is saved can repeat that effect. Side-effecting tools should support
 idempotency. Repeated IDs are deduplicated while an envelope remains queued.
 
-Use one process per environment data directory. The standalone `call-model`
-command remains a direct model call; it does not start inbox workers. Use the
-runtime messaging commands for automatic agent-to-agent delivery.
+Use one process per environment data directory.
 
 ## Embedding in Go
 
@@ -63,7 +61,7 @@ Create or load an environment and its agents, then call `env.Start(ctx)` to
 start workers. Submit `env.Message(ctx, api.Envelope{...})`, inspect with
 `env.Inbox(name)`, and use `env.RetryInbox(ctx, name)` for paused work. Call
 `env.Close()` to cancel workers, preserve unfinished messages, and wait for them
-to exit. `env.Wait()` only waits for memory embedding work.
+to exit.
 
 The Unix-socket API exposes:
 

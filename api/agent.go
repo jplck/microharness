@@ -140,18 +140,6 @@ func generateSessionID() string {
 	return rand.Text()
 }
 
-func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
-	a.runMu.Lock()
-	defer a.runMu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return Message{}, err
-	}
-	if err := a.Session.AddMessage(input); err != nil {
-		return Message{}, fmt.Errorf("add input message: %w", err)
-	}
-	return a.continueTurn(ctx)
-}
-
 func (a *Agent) executeEnvelope(ctx context.Context, envelope Envelope) error {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
