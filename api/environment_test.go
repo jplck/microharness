@@ -76,7 +76,7 @@ func TestEnvironmentRoundTrip(t *testing.T) {
 	if string(gotMemories) != string(wantMemories) {
 		t.Fatal("shared memories not restored")
 	}
-	if len(restored.Tools) != len(MemoryTools(ctx, loaded.MemoryStore))+1 {
+	if len(restored.Tools) != len(MemoryTools(ctx, loaded.MemoryStore))+len(loaded.messagingTools(restored.Name))+1 {
 		t.Fatal("tool set not restored")
 	}
 	for _, tool := range restored.Tools {

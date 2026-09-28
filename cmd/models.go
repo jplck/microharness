@@ -1,7 +1,9 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -51,7 +53,7 @@ var environmentCreateAgentCmd = &cobra.Command{
 		path := "/environments/" + url.PathEscape(args[0]) +
 			"/agents/" + url.PathEscape(args[1]) +
 			"?" + url.Values{"model": []string{args[2]}}.Encode()
-		return runtimeRequest(cmd, http.MethodPost, path)
+		return runtimeRequest(cmd, http.MethodPost, path, nil)
 	},
 }
 
@@ -66,7 +68,7 @@ var environmentCreateCmd = &cobra.Command{
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runtimeRequest(cmd, http.MethodPost,
-			"/environments/"+url.PathEscape(args[0]))
+			"/environments/"+url.PathEscape(args[0]), nil)
 	},
 }
 
@@ -75,11 +77,42 @@ var environmentListCmd = &cobra.Command{
 	Short: "List active environments",
 	Args:  cobra.NoArgs,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runtimeRequest(cmd, http.MethodGet, "/environments")
+		return runtimeRequest(cmd, http.MethodGet, "/environments", nil)
 	},
 }
 
-func runtimeRequest(cmd *cobra.Command, method, path string) error {
+var environmentMessageCmd = &cobra.Command{
+	Use: "message <environment> <agent> <content>", Short: "Queue a message for an agent", Args: cobra.ExactArgs(3),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		sender, _ := cmd.Flags().GetString("sender")
+		conversation, _ := cmd.Flags().GetString("conversation")
+		replyTo, _ := cmd.Flags().GetString("reply-to")
+		data, err := json.Marshal(api.Envelope{
+			Source: "cli", Sender: sender, To: args[1], Content: args[2],
+			ConversationID: conversation, ReplyTo: replyTo,
+		})
+		if err != nil {
+			return err
+		}
+		return runtimeRequest(cmd, http.MethodPost, "/environments/"+url.PathEscape(args[0])+"/messages", bytes.NewReader(data))
+	},
+}
+
+var environmentInboxCmd = &cobra.Command{
+	Use: "inbox <environment> <agent>", Short: "Show pending messages and inbox errors", Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runtimeRequest(cmd, http.MethodGet, "/environments/"+url.PathEscape(args[0])+"/agents/"+url.PathEscape(args[1])+"/inbox", nil)
+	},
+}
+
+var environmentRetryInboxCmd = &cobra.Command{
+	Use: "retry-inbox <environment> <agent>", Short: "Resume a paused agent inbox", Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runtimeRequest(cmd, http.MethodPost, "/environments/"+url.PathEscape(args[0])+"/agents/"+url.PathEscape(args[1])+"/inbox/retry", nil)
+	},
+}
+
+func runtimeRequest(cmd *cobra.Command, method, path string, body io.Reader) error {
 	transport := &http.Transport{
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			return (&net.Dialer{}).DialContext(ctx, "unix", environmentSocket)
@@ -88,10 +121,13 @@ func runtimeRequest(cmd *cobra.Command, method, path string) error {
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
 	request, err := http.NewRequestWithContext(
-		cmd.Context(), method, "http://localhost"+path, nil,
+		cmd.Context(), method, "http://localhost"+path, body,
 	)
 	if err != nil {
 		return err
+	}
+	if body != nil {
+		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := client.Do(request)
 	if err != nil {
@@ -105,11 +141,10 @@ func runtimeRequest(cmd *cobra.Command, method, path string) error {
 		}
 		return fmt.Errorf("runtime returned %s: %s", response.Status, body)
 	}
-	if method == http.MethodPost {
-		cmd.Println("Environment created.")
-		return nil
+	written, err := io.Copy(cmd.OutOrStdout(), response.Body)
+	if err == nil && method == http.MethodPost && written == 0 {
+		cmd.Println("Request accepted.")
 	}
-	_, err = io.Copy(cmd.OutOrStdout(), response.Body)
 	return err
 }
 
@@ -193,5 +228,9 @@ func init() {
 		&environmentSocket, "socket", "/tmp/micro.sock", "Runtime Unix socket",
 	)
 	environmentCmd.AddCommand(environmentCreateCmd, environmentListCmd, environmentCreateAgentCmd)
+	environmentMessageCmd.Flags().String("sender", "cli", "External sender identity")
+	environmentMessageCmd.Flags().String("conversation", "", "Conversation ID (generated when omitted)")
+	environmentMessageCmd.Flags().String("reply-to", "", "Envelope ID being answered")
+	environmentCmd.AddCommand(environmentMessageCmd, environmentInboxCmd, environmentRetryInboxCmd)
 	rootCmd.AddCommand(environmentCmd)
 }

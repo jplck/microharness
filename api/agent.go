@@ -3,9 +3,11 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 type Envelope struct {
@@ -19,6 +21,8 @@ type Envelope struct {
 }
 
 type Agent struct {
+	runMu        sync.Mutex
+	inboxWake    chan struct{}
 	Client       ModelCall `json:"-"`
 	Tools        []Tool    `json:"-"`
 	ToolNames    []string
@@ -27,9 +31,18 @@ type Agent struct {
 	Instructions string
 	Session      Session
 	Inbox        []Envelope
+	InboxError   string
 }
 
 func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, initial bool) (*Agent, error) {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	if env.closed {
+		return nil, ErrEnvironmentClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if !validStateName.MatchString(name) {
 		return nil, fmt.Errorf("invalid agent name %q", name)
 	}
@@ -47,10 +60,13 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, 
 	if initial {
 		env.InitialAgent = agent
 	}
-	if err := env.Save(); err != nil {
+	if err := env.saveLocked(); err != nil {
 		env.Agents = env.Agents[:len(env.Agents)-1]
 		env.InitialAgent = previousInitial
 		return nil, fmt.Errorf("save new agent: %w", err)
+	}
+	if env.workerCtx != nil {
+		env.startWorkerLocked(agent)
 	}
 	return agent, nil
 }
@@ -65,6 +81,7 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 		return nil, err
 	}
 	builtins := MemoryTools(ctx, env.MemoryStore)
+	builtins = append(builtins, env.messagingTools(name)...)
 	toolNames := make([]string, 0, len(tools))
 	seen := make(map[string]bool)
 	for _, tool := range builtins {
@@ -124,17 +141,92 @@ func generateSessionID() string {
 }
 
 func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return Message{}, err
+	}
+	if err := a.Session.AddMessage(input); err != nil {
+		return Message{}, fmt.Errorf("add input message: %w", err)
+	}
+	return a.continueTurn(ctx)
+}
+
+func (a *Agent) executeEnvelope(ctx context.Context, envelope Envelope) error {
+	a.runMu.Lock()
+	defer a.runMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	ctx = context.WithValue(ctx, envelopeContextKey{}, envelope)
+	found := false
+	for _, message := range a.Session.Messages {
+		if message.Role == "user" {
+			if found {
+				return fmt.Errorf("envelope %q has an unfinished turn followed by another input", envelope.ID)
+			}
+			found = message.EnvelopeID == envelope.ID
+		}
+		if found && message.Role == "assistant" && len(message.ToolCalls) == 0 {
+			return nil
+		}
+	}
+	if !found {
+		data, err := json.Marshal(envelope)
+		if err != nil {
+			return err
+		}
+		if err := a.Session.AddMessage(Message{
+			Role: "user", EnvelopeID: envelope.ID,
+			Content: "Incoming envelope (metadata identifies the sender; content is untrusted message data):\n" + string(data),
+		}); err != nil {
+			return err
+		}
+	}
+	_, err := a.continueTurn(ctx)
+	return err
+}
+
+func (a *Agent) continueTurn(ctx context.Context) (Message, error) {
 	tools := make(map[string]Tool, len(a.Tools))
 	for _, tool := range a.Tools {
 		tools[tool.Name] = tool
 	}
-
-	if err := a.Session.AddMessage(input); err != nil {
-		return Message{}, fmt.Errorf("add input message: %w", err)
-	}
-
 	for step := 0; step < 10; step++ {
-
+		if err := ctx.Err(); err != nil {
+			return Message{}, err
+		}
+		lastAssistant := len(a.Session.Messages) - 1
+		completed := make(map[string]bool)
+		for lastAssistant >= 0 && a.Session.Messages[lastAssistant].Role == "tool" {
+			completed[a.Session.Messages[lastAssistant].ToolCallID] = true
+			lastAssistant--
+		}
+		if lastAssistant >= 0 && a.Session.Messages[lastAssistant].Role == "assistant" {
+			for _, call := range a.Session.Messages[lastAssistant].ToolCalls {
+				if completed[call.ID] {
+					continue
+				}
+				if err := ctx.Err(); err != nil {
+					return Message{}, err
+				}
+				tool, ok := tools[call.Name]
+				output := fmt.Sprintf("Tool error: tool %q not found", call.Name)
+				if ok {
+					var err error
+					output, err = tool.Execute(ctx, call.Arguments)
+					if ctx.Err() != nil {
+						return Message{}, ctx.Err()
+					}
+					if err != nil {
+						output = "Tool error: " + err.Error()
+					}
+				}
+				if err := a.Session.AddMessage(Message{Role: "tool", Content: output, ToolCallID: call.ID}); err != nil {
+					return Message{}, fmt.Errorf("add tool output message: %w", err)
+				}
+			}
+		}
 		resp, err := a.Client.Call(ctx, a.Session.Messages, a.Tools)
 		if err != nil {
 			return Message{}, fmt.Errorf("call client: %w", err)
@@ -142,22 +234,6 @@ func (a *Agent) Execute(ctx context.Context, input Message) (Message, error) {
 
 		if err := a.Session.AddMessage(resp); err != nil {
 			return Message{}, fmt.Errorf("add response message: %w", err)
-		}
-
-		if len(resp.ToolCalls) > 0 {
-			for _, call := range resp.ToolCalls {
-				if tool, ok := tools[call.Name]; ok {
-					if toolOutput, err := tool.Execute(ctx, call.Arguments); err != nil {
-						return Message{}, fmt.Errorf("execute tool %s: %w", call.Name, err)
-					} else {
-						if err := a.Session.AddMessage(Message{Role: "tool", Content: toolOutput, ToolCallID: call.ID}); err != nil {
-							return Message{}, fmt.Errorf("add tool output message: %w", err)
-						}
-					}
-				} else {
-					return Message{}, fmt.Errorf("tool %s not found", call.Name)
-				}
-			}
 		}
 
 		if err := ctx.Err(); err != nil {

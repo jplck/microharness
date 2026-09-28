@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sync"
 )
 
 var validStateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
@@ -15,6 +16,11 @@ var validStateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 type ToolRegistry map[string]Tool
 
 type AgentEnvironment struct {
+	mu           sync.Mutex
+	workerCtx    context.Context
+	workerCancel context.CancelFunc
+	workerWG     sync.WaitGroup
+	closed       bool
 	Agents       []*Agent
 	MemoryStore  *MemoryStore
 	InitialAgent *Agent
@@ -39,6 +45,7 @@ type AgentState struct {
 	SessionID    string     `json:"session_id"`
 	ToolNames    []string   `json:"tools,omitempty"`
 	Inbox        []Envelope `json:"inbox,omitempty"`
+	InboxError   string     `json:"inbox_error,omitempty"`
 }
 
 func NewAgentEnvironment(ctx context.Context, dataRoot, name string) (*AgentEnvironment, error) {
@@ -126,6 +133,7 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 			return nil, fmt.Errorf("restore agent %q: %w", saved.Name, err)
 		}
 		agent.Inbox = saved.Inbox
+		agent.InboxError = saved.InboxError
 		env.Agents = append(env.Agents, agent)
 		if saved.Name == state.InitialAgentName {
 			env.InitialAgent = agent
@@ -138,6 +146,12 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 }
 
 func (env *AgentEnvironment) Save() error {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	return env.saveLocked()
+}
+
+func (env *AgentEnvironment) saveLocked() error {
 	state := EnvironmentState{
 		Version: 1, ID: env.ID, Name: env.Name,
 		EmbeddingModel: env.MemoryStore.EmbeddingModel,
@@ -150,6 +164,7 @@ func (env *AgentEnvironment) Save() error {
 		state.Agents = append(state.Agents, AgentState{
 			Name: agent.Name, ModelName: agent.ModelName, Instructions: agent.Instructions,
 			SessionID: agent.Session.SessionID, ToolNames: agent.ToolNames, Inbox: agent.Inbox,
+			InboxError: agent.InboxError,
 		})
 	}
 	if err := writeJSONAtomic(filepath.Join(env.DataRoot, "environment.json"), state); err != nil {

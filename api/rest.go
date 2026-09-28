@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,6 +23,72 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		return err
 	}
 	mux := http.NewServeMux()
+	lookupEnvironment := func(w http.ResponseWriter, r *http.Request) *AgentEnvironment {
+		mu.Lock()
+		env := environments[r.PathValue("id")]
+		mu.Unlock()
+		if env == nil {
+			http.Error(w, "environment not found", http.StatusNotFound)
+		}
+		return env
+	}
+	mux.HandleFunc("POST /environments/{id}/messages", func(w http.ResponseWriter, r *http.Request) {
+		env := lookupEnvironment(w, r)
+		if env == nil {
+			return
+		}
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
+		decoder.DisallowUnknownFields()
+		var envelope Envelope
+		if err := decoder.Decode(&envelope); err != nil {
+			http.Error(w, "invalid envelope JSON", http.StatusBadRequest)
+			return
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			http.Error(w, "expected one envelope", http.StatusBadRequest)
+			return
+		}
+		if envelope.Source == "agent" {
+			http.Error(w, "agent source is reserved for the message tool", http.StatusBadRequest)
+			return
+		}
+		id, err := env.Message(r.Context(), envelope)
+		if err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		if err := json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "accepted"}); err != nil {
+			log.Printf("message acknowledgement failed: %v", err)
+		}
+	})
+	mux.HandleFunc("GET /environments/{id}/agents/{name}/inbox", func(w http.ResponseWriter, r *http.Request) {
+		env := lookupEnvironment(w, r)
+		if env == nil {
+			return
+		}
+		inbox, err := env.Inbox(r.PathValue("name"))
+		if err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(inbox); err != nil {
+			log.Printf("inbox response failed: %v", err)
+		}
+	})
+	mux.HandleFunc("POST /environments/{id}/agents/{name}/inbox/retry", func(w http.ResponseWriter, r *http.Request) {
+		env := lookupEnvironment(w, r)
+		if env == nil {
+			return
+		}
+		if err := env.RetryInbox(r.Context(), r.PathValue("name")); err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		w.WriteHeader(http.StatusAccepted)
+	})
 	mux.HandleFunc("POST /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		if !validStateName.MatchString(name) {
@@ -76,6 +143,10 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			http.Error(w, "cannot create environment", http.StatusInternalServerError)
 			return
 		}
+		if err := env.Start(ctx); err != nil {
+			http.Error(w, "cannot start environment", http.StatusServiceUnavailable)
+			return
+		}
 		environments[id] = env
 		log.Printf("environment created: id=%s data=%s", id, env.DataRoot)
 		w.WriteHeader(http.StatusCreated)
@@ -97,6 +168,22 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		return fmt.Errorf("restrict runtime socket permissions: %w", err)
+	}
+	defer func() {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, env := range environments {
+			env.Close()
+		}
+	}()
+	for _, env := range environments {
+		if err := env.Start(ctx); err != nil {
+			return fmt.Errorf("start environment %q: %w", env.Name, err)
+		}
+	}
 	server := &http.Server{Handler: mux, ReadHeaderTimeout: 5 * time.Second}
 	shutdownDone := make(chan struct{})
 	stop := context.AfterFunc(ctx, func() {
@@ -114,11 +201,6 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			<-shutdownDone
 		}
 		server.Close()
-		mu.Lock()
-		defer mu.Unlock()
-		for _, env := range environments {
-			env.Wait()
-		}
 	}()
 	log.Printf("runtime listening: socket=%s data=%s", socketPath, dataRoot)
 	err = server.Serve(listener)
@@ -127,6 +209,20 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		return nil
 	}
 	return err
+}
+
+func writeMessagingError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, ErrAgentNotFound):
+		http.Error(w, err.Error(), http.StatusNotFound)
+	case errors.Is(err, ErrInvalidEnvelope):
+		http.Error(w, err.Error(), http.StatusBadRequest)
+	case errors.Is(err, ErrEnvironmentClosed), errors.Is(err, context.Canceled):
+		http.Error(w, "environment is stopping", http.StatusServiceUnavailable)
+	default:
+		log.Printf("messaging operation failed: %v", err)
+		http.Error(w, "messaging operation failed", http.StatusInternalServerError)
+	}
 }
 
 func loadAgentEnvironments(ctx context.Context, dataRoot string, registry ToolRegistry) (map[string]*AgentEnvironment, error) {

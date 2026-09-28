@@ -6,8 +6,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"reflect"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -120,5 +123,110 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 	}
 	if restored.ID != loaded.ID || len(restored.Agents) != 2 || restored.InitialAgent.Session.SessionID != loaded.InitialAgent.Session.SessionID {
 		t.Fatal("restart lost original identity, agents, or session")
+	}
+}
+
+func TestRuntimeMessagingAPI(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	var available atomic.Bool
+	var calls atomic.Int32
+	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if !available.Load() {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"error":{"message":"model unavailable","type":"invalid_request_error"}}`)
+			return
+		}
+		io.WriteString(w, `{"id":"reply","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"Completed"}}]}`)
+	}))
+	defer modelServer.Close()
+	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI, Endpoint: modelServer.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	client, stop := startTestRuntime(t, root)
+	request := func(method, path, body string, status int) []byte {
+		t.Helper()
+		req, err := http.NewRequest(method, "http://localhost"+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		data, err := io.ReadAll(response.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != status {
+			t.Fatalf("%s %s returned %s: %s", method, path, response.Status, data)
+		}
+		return data
+	}
+	request(http.MethodPost, "/environments/mail", "", http.StatusCreated)
+	request(http.MethodPost, "/environments/mail/agents/recipient?model=test-model", "", http.StatusCreated)
+	for _, body := range []string{
+		`{"Source":"agent","Sender":"recipient","Content":"spoofed"}`,
+		`{"Sender":"user","Content":""}`,
+		`{"Content":"missing sender"}`,
+		`{"Sender":"user","Content":"extra JSON"} {}`,
+		`{"Sender":"user","Content":"unknown field","unknown":1}`,
+	} {
+		request(http.MethodPost, "/environments/mail/messages", body, http.StatusBadRequest)
+	}
+	request(http.MethodPost, "/environments/missing/messages", `{}`, http.StatusNotFound)
+	request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","To":"missing","Content":"hello"}`, http.StatusNotFound)
+	request(http.MethodGet, "/environments/mail/agents/missing/inbox", "", http.StatusNotFound)
+	request(http.MethodPost, "/environments/mail/agents/missing/inbox/retry", "", http.StatusNotFound)
+	data := request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","Content":"First job","ConversationID":"thread-1"}`, http.StatusAccepted)
+	var receipt map[string]string
+	if err := json.Unmarshal(data, &receipt); err != nil || receipt["id"] == "" || receipt["status"] != "accepted" {
+		t.Fatalf("invalid receipt: %s, %v", data, err)
+	}
+	waitInbox := func(ready func(InboxState) bool) {
+		t.Helper()
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		deadline := time.NewTimer(5 * time.Second)
+		defer deadline.Stop()
+		for {
+			data := request(http.MethodGet, "/environments/mail/agents/recipient/inbox", "", http.StatusOK)
+			var inbox InboxState
+			if err := json.Unmarshal(data, &inbox); err != nil {
+				t.Fatal(err)
+			}
+			if ready(inbox) {
+				return
+			}
+			select {
+			case <-ticker.C:
+			case <-deadline.C:
+				t.Fatalf("inbox state did not match: %s", data)
+			}
+		}
+	}
+	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 1 && inbox.Error != "" })
+	stop()
+	available.Store(true)
+	client, stop = startTestRuntime(t, root)
+	request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","To":"recipient","Content":"Second job"}`, http.StatusAccepted)
+	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 2 && inbox.Error != "" })
+	request(http.MethodPost, "/environments/mail/agents/recipient/inbox/retry", "", http.StatusAccepted)
+	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 0 && inbox.Error == "" })
+	stop()
+	loaded, err := LoadAgentEnvironment(ctx, root, "mail", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inputs := 0
+	for _, message := range loaded.InitialAgent.Session.Messages {
+		if message.EnvelopeID != "" {
+			inputs++
+		}
+	}
+	if calls.Load() != 3 || inputs != 2 {
+		t.Fatalf("unexpected model calls or duplicated inputs: %d calls, %d inputs", calls.Load(), inputs)
 	}
 }

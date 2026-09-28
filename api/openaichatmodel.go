@@ -15,6 +15,7 @@ type OpenAIChatModel struct {
 }
 
 type Message struct {
+	EnvelopeID string `json:"EnvelopeID,omitempty"`
 	Role       string
 	Content    string     `json:"Content,omitempty"`
 	ToolCalls  []ToolCall `json:"ToolCalls,omitempty"`
