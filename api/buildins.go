@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-func MemoryTools(store *MemoryStore) []Tool {
+func MemoryTools(ctx context.Context, store *MemoryStore) []Tool {
 	return []Tool{
 		{
 			Name:        "search_memory",
@@ -54,7 +54,7 @@ func MemoryTools(store *MemoryStore) []Tool {
 					return "", fmt.Errorf("kind must be fact, episode, or procedure")
 				}
 
-				if err := store.Add(Memory{
+				if err := store.Add(ctx, Memory{
 					Kind:      arguments.Kind,
 					Content:   arguments.Content,
 					UpdatedAt: time.Now(),

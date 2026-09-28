@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,12 +26,13 @@ type Memory struct {
 
 type MemoryStore struct {
 	Path           string
-	Entries        []Memory
+	entries        []Memory
 	EmbeddingModel string
+	mu             sync.RWMutex
 }
 
 func LoadMemories(path string) (*MemoryStore, error) {
-	store := &MemoryStore{Path: path, Entries: []Memory{}}
+	store := &MemoryStore{Path: path, entries: []Memory{}}
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return store, nil
@@ -37,14 +40,14 @@ func LoadMemories(path string) (*MemoryStore, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := json.Unmarshal(data, &store.Entries); err != nil {
+	if err := json.Unmarshal(data, &store.entries); err != nil {
 		return nil, err
 	}
 	return store, nil
 }
 
 func (store *MemoryStore) save() error {
-	data, err := json.MarshalIndent(store.Entries, "", "  ")
+	data, err := json.MarshalIndent(store.entries, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -67,7 +70,7 @@ func (store *MemoryStore) save() error {
 	return os.Rename(file.Name(), store.Path)
 }
 
-func (store *MemoryStore) Add(memory Memory) error {
+func (store *MemoryStore) Add(ctx context.Context, memory Memory) error {
 
 	if store.EmbeddingModel != "" {
 		model, err := GetModelByName(store.EmbeddingModel)
@@ -80,7 +83,7 @@ func (store *MemoryStore) Add(memory Memory) error {
 			return fmt.Errorf("create model client: %w", err)
 		}
 
-		embedding, err := client.Embed(context.Background(), memory.Content)
+		embedding, err := client.Embed(ctx, memory.Content)
 		if err != nil {
 			return fmt.Errorf("embed memory content: %w", err)
 		}
@@ -88,24 +91,38 @@ func (store *MemoryStore) Add(memory Memory) error {
 		memory.EmbeddingModel = store.EmbeddingModel
 	}
 
+	store.mu.Lock()
+	defer store.mu.Unlock()
+
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	previous := store.entries
+
 	memory.UpdatedAt = time.Now()
-	store.Entries = append(store.Entries, memory)
+	store.entries = append(store.entries, memory)
 	if err := store.save(); err != nil {
+		store.entries = previous
 		return err
 	}
 	return nil
 }
 
 func (store *MemoryStore) Search(query string) []Memory {
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+
 	query = strings.ToLower(strings.TrimSpace(query))
 	matches := []Memory{}
 	if query == "" {
 		return matches
 	}
 
-	for index := len(store.Entries) - 1; index >= 0; index-- {
-		memory := store.Entries[index]
+	for index := len(store.entries) - 1; index >= 0; index-- {
+		memory := store.entries[index]
 		if strings.Contains(strings.ToLower(memory.Content), query) {
+			memory.Embedding = slices.Clone(memory.Embedding)
 			matches = append(matches, memory)
 		}
 	}

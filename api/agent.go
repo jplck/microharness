@@ -22,7 +22,7 @@ type Agent struct {
 func CreateAgent(ctx context.Context, client ModelCall, tools []Tool, name string, instructions string, sessionID string) (*Agent, error) {
 
 	memoryStore := MemoryStore{Path: "memory.json", EmbeddingModel: "nomic-embed-text"}
-	tools = append(MemoryTools(&memoryStore), tools...)
+	tools = append(MemoryTools(ctx, &memoryStore), tools...)
 
 	session := Session{SessionID: sessionID, Scope: "Sessions/"}
 
