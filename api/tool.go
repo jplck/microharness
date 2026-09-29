@@ -45,17 +45,6 @@ type ToolSummary struct {
 	Description string `json:"description"`
 }
 
-func contextTool[T any](definition Tool, handler func(context.Context, ToolContext, T) (string, error)) Tool {
-	definition.bind = func(binding ToolContext) Tool {
-		bound := definition
-		bound.Execute = JSONHandler(func(ctx context.Context, arguments T) (string, error) {
-			return handler(ctx, binding, arguments)
-		})
-		return bound
-	}
-	return definition
-}
-
 func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {
 	properties := make(map[string]any, len(t.Parameters))
 	required := []string{}

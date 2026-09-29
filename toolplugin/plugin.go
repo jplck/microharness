@@ -1,17 +1,12 @@
 package toolplugin
 
 import (
-	"bytes"
-	"context"
 	_ "embed"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"os"
-	"time"
 )
 
 type ParameterType string
@@ -125,45 +120,4 @@ func Handler[Arguments any](call func(Arguments) (string, error)) func(json.RawM
 		}
 		return call(arguments)
 	}
-}
-
-func Host(operation string, arguments any, result any) error {
-	data, err := json.Marshal(arguments)
-	if err != nil {
-		return err
-	}
-	transport := &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-		return (&net.Dialer{}).DialContext(ctx, "unix", os.Getenv("MICRO_PLUGIN_SOCKET"))
-	}}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 120 * time.Second}
-	response, err := client.Post("http://runtime/"+operation, "application/json", bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	defer response.Body.Close()
-	data, err = io.ReadAll(io.LimitReader(response.Body, (1<<20)+1))
-	if err != nil {
-		return err
-	}
-	if len(data) > 1<<20 {
-		return fmt.Errorf("host response exceeds 1 MiB")
-	}
-	if response.StatusCode != http.StatusOK {
-		return fmt.Errorf("%s", data)
-	}
-	var reply Response
-	if err := json.Unmarshal(data, &reply); err != nil {
-		return err
-	}
-	if reply.ProtocolVersion != ProtocolVersion {
-		return fmt.Errorf("unsupported host protocol version")
-	}
-	if reply.Error != "" {
-		return &RemoteError{Message: reply.Error, Code: reply.Code}
-	}
-	if result == nil {
-		return nil
-	}
-	return json.Unmarshal([]byte(reply.Result), result)
 }

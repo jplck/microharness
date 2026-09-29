@@ -188,6 +188,7 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 
 func TestRuntimeToolSelection(t *testing.T) {
 	ctx, root, _ := setupPersistenceTest(t)
+	t.Setenv("PATH", t.TempDir())
 	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI}, {Name: "other-model", Provider: ProviderOpenAI}}}); err != nil {
 		t.Fatal(err)
 	}

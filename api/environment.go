@@ -128,7 +128,7 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 			if !validStateName.MatchString(name) {
 				return nil, fmt.Errorf("invalid saved plugin path %q", name)
 			}
-			binary, err := readPlugin(ctx, filepath.Join(directory, "plugins", name, "tool"), false)
+			binary, err := readPlugin(ctx, filepath.Join(directory, "plugins", name, "tool"))
 			if err != nil {
 				return nil, fmt.Errorf("restore agent %q plugin: %w", saved.Name, err)
 			}

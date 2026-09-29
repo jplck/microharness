@@ -103,14 +103,14 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 	if err := buildPlugin(ctx, directory, request.Source); err != nil {
 		return fmt.Errorf("build plugin: %w", err)
 	}
-	binary, err := readPlugin(ctx, filepath.Join(directory, "tool"), false)
+	binary, err := readPlugin(ctx, filepath.Join(directory, "tool"))
 	if err != nil {
 		return err
 	}
 	if len(binary.Definitions) != 1 || binary.Definitions[0].Name != request.Name {
 		return fmt.Errorf("plugin must describe exactly the requested tool %q", request.Name)
 	}
-	result, err := binary.call(ctx, request.Name, json.RawMessage(request.TestArguments), ToolContext{})
+	result, err := binary.call(ctx, request.Name, json.RawMessage(request.TestArguments))
 	if err != nil {
 		return fmt.Errorf("plugin test: %w", err)
 	}

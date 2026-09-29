@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,36 +21,52 @@ func TestMain(tests *testing.M) {
 		os.Exit(1)
 	}
 	examplePluginSource = string(source)
-	directory, err := os.MkdirTemp("", "micro-plugin-tests-*")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	command := exec.Command("go", "build", "-o", filepath.Join(directory, "builtin"), "../cmd/micro-tools")
-	command.Stdout, command.Stderr = os.Stdout, os.Stderr
-	if err := command.Run(); err != nil {
-		os.RemoveAll(directory)
-		os.Exit(1)
-	}
-	os.Setenv("MICRO_BUILTIN_PLUGIN", filepath.Join(directory, "builtin"))
-	code := tests.Run()
-	os.RemoveAll(directory)
-	os.Exit(code)
+	os.Exit(tests.Run())
 }
 
 func TestPluginCatalogue(t *testing.T) {
-	registry, cache, err := loadPluginCatalogue(t.Context(), t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	t.Setenv("PATH", t.TempDir())
+	for _, directory := range []string{t.TempDir(), filepath.Join(t.TempDir(), "missing")} {
+		registry, cache, err := loadPluginCatalogue(t.Context(), directory)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(cache) })
+		if len(registry) != 9 {
+			t.Fatalf("tool count: %d", len(registry))
+		}
+		for name, tool := range registry {
+			if tool.plugin != nil || tool.bind == nil {
+				t.Fatalf("built-in %s is not native", name)
+			}
+		}
+		tool := registry["get_time"].bind(ToolContext{Environment: &AgentEnvironment{}, Caller: "caller"})
+		result, err := tool.Execute(t.Context(), json.RawMessage(`{"location":"UTC"}`))
+		if err != nil || !strings.HasPrefix(result, "Current time in UTC: ") {
+			t.Fatalf("native call: %q %v", result, err)
+		}
 	}
-	defer os.RemoveAll(cache)
-	if len(registry) != 9 {
-		t.Fatalf("tool count: %d", len(registry))
-	}
-	tool := registry["get_time"]
-	result, err := tool.plugin.call(t.Context(), tool.Name, json.RawMessage(`{"location":"UTC"}`), ToolContext{})
-	if err != nil || result == "" {
-		t.Fatalf("binary call: %q %v", result, err)
+}
+
+func TestPluginCannotReplaceBuiltins(t *testing.T) {
+	for _, name := range []string{"get_time", "message"} {
+		t.Run(name, func(t *testing.T) {
+			buildDirectory, pluginDirectory := t.TempDir(), t.TempDir()
+			source := strings.Replace(examplePluginSource, `Name: "echo"`, `Name: "`+name+`"`, 1)
+			if err := buildPlugin(t.Context(), buildDirectory, source); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(filepath.Join(buildDirectory, "tool"), filepath.Join(pluginDirectory, "collision")); err != nil {
+				t.Fatal(err)
+			}
+			_, cache, err := loadPluginCatalogue(t.Context(), pluginDirectory)
+			if cache != "" {
+				t.Cleanup(func() { os.RemoveAll(cache) })
+			}
+			if !errors.Is(err, ErrInvalidTool) {
+				t.Fatalf("plugin replaced native %s: %v", name, err)
+			}
+		})
 	}
 }
 
@@ -81,6 +96,13 @@ func TestCreatePlugin(t *testing.T) {
 	}
 	if err := env.CreatePlugin(ctx, "maker", request); !errors.Is(err, ErrInvalidTool) {
 		t.Fatalf("duplicate allowed: %v", err)
+	}
+	for name := range DefaultTools() {
+		reserved := request
+		reserved.Name = name
+		if err := env.CreatePlugin(ctx, "maker", reserved); !errors.Is(err, ErrInvalidTool) {
+			t.Fatalf("private tool replaced native %s: %v", name, err)
+		}
 	}
 	restored, err := LoadAgentEnvironment(ctx, root, "plugins", DefaultTools())
 	if err != nil {
@@ -168,6 +190,12 @@ func TestPluginReplacement(t *testing.T) {
 		if tool.Name == "echo" {
 			t.Fatal("removed plugin still offered")
 		}
+		if tool.plugin != nil || !tool.Automatic {
+			t.Fatalf("reload changed native automatic tool %s", tool.Name)
+		}
+	}
+	if len(agent.currentTools()) != 6 {
+		t.Fatal("reload removed native automatic tools")
 	}
 }
 
@@ -215,19 +243,19 @@ func TestPluginProcessLimits(t *testing.T) {
 	if err := buildPlugin(t.Context(), directory, source); err != nil {
 		t.Fatal(err)
 	}
-	binary, err := readPlugin(t.Context(), filepath.Join(directory, "tool"), false)
+	binary, err := readPlugin(t.Context(), filepath.Join(directory, "tool"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, input := range []string{"overflow", "invalid"} {
 		arguments, _ := json.Marshal(map[string]string{"input": input})
-		if _, err := binary.call(t.Context(), "echo", arguments, ToolContext{}); err == nil {
+		if _, err := binary.call(t.Context(), "echo", arguments); err == nil {
 			t.Fatalf("%s accepted", input)
 		}
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
 	defer cancel()
-	if _, err := binary.call(ctx, "echo", json.RawMessage(`{"input":"hang"}`), ToolContext{}); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := binary.call(ctx, "echo", json.RawMessage(`{"input":"hang"}`)); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("timeout: %v", err)
 	}
 }

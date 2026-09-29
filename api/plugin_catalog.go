@@ -17,7 +17,7 @@ import (
 
 var pluginToolName = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 
-func readPlugin(ctx context.Context, path string, builtin bool) (*pluginBinary, error) {
+func readPlugin(ctx context.Context, path string) (*pluginBinary, error) {
 	absolute, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
@@ -40,7 +40,7 @@ func readPlugin(ctx context.Context, path string, builtin bool) (*pluginBinary, 
 	}
 	seen := map[string]bool{}
 	for _, definition := range manifest.Tools {
-		if !pluginToolName.MatchString(definition.Name) || seen[definition.Name] || strings.TrimSpace(definition.Description) == "" || len(definition.Description) > 8192 || (!builtin && definition.Automatic) {
+		if !pluginToolName.MatchString(definition.Name) || seen[definition.Name] || strings.TrimSpace(definition.Description) == "" || len(definition.Description) > 8192 || definition.Automatic {
 			return nil, fmt.Errorf("%w: plugin definition %q", ErrInvalidTool, definition.Name)
 		}
 		seen[definition.Name] = true
@@ -61,7 +61,7 @@ func readPlugin(ctx context.Context, path string, builtin bool) (*pluginBinary, 
 			}
 		}
 	}
-	return &pluginBinary{Path: absolute, Builtin: builtin, Definitions: manifest.Tools}, nil
+	return &pluginBinary{Path: absolute, Definitions: manifest.Tools}, nil
 }
 
 func loadPluginCatalogue(ctx context.Context, pluginDirectory string) (ToolRegistry, string, error) {
@@ -75,8 +75,8 @@ func loadPluginCatalogue(ctx context.Context, pluginDirectory string) (ToolRegis
 			os.RemoveAll(cache)
 		}
 	}()
-	registry := ToolRegistry{}
-	load := func(path string, builtin bool) error {
+	registry := DefaultTools()
+	load := func(path string) error {
 		input, err := os.Open(path)
 		if err != nil {
 			return err
@@ -104,7 +104,7 @@ func loadPluginCatalogue(ctx context.Context, pluginDirectory string) (ToolRegis
 		if err := output.Close(); err != nil {
 			return err
 		}
-		binary, err := readPlugin(ctx, output.Name(), builtin)
+		binary, err := readPlugin(ctx, output.Name())
 		if err != nil {
 			return err
 		}
@@ -116,24 +116,10 @@ func loadPluginCatalogue(ctx context.Context, pluginDirectory string) (ToolRegis
 		}
 		return nil
 	}
-	if err := load(builtinPluginPath(), true); err != nil {
-		return nil, "", fmt.Errorf("load bundled plugin (build with go build -o plugins/bin/builtin ./cmd/micro-tools): %w", err)
-	}
-	defaults := DefaultTools()
-	if len(registry) != len(defaults) {
-		return nil, "", fmt.Errorf("bundled plugin tool set does not match runtime")
-	}
-	for name, expected := range defaults {
-		actual, exists := registry[name]
-		if !exists || actual.Automatic != expected.Automatic {
-			return nil, "", fmt.Errorf("bundled plugin missing or reclassifies %q", name)
-		}
-	}
 	entries, err := os.ReadDir(pluginDirectory)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, "", err
 	}
-	builtinPath, _ := filepath.Abs(builtinPluginPath())
 	for _, entry := range entries {
 		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
 			continue
@@ -142,10 +128,7 @@ func loadPluginCatalogue(ctx context.Context, pluginDirectory string) (ToolRegis
 		if err != nil {
 			return nil, "", err
 		}
-		if path == builtinPath {
-			continue
-		}
-		if err := load(path, false); err != nil {
+		if err := load(path); err != nil {
 			return nil, "", fmt.Errorf("load plugin %q: %w", entry.Name(), err)
 		}
 	}
@@ -174,9 +157,11 @@ func (agent *Agent) currentTools() []Tool {
 		if tool.plugin != nil && env.registry != nil {
 			if replacement, exists := env.registry[tool.Name]; exists {
 				tool = replacement
-			} else if !tool.plugin.Builtin {
+			} else {
 				continue
 			}
+		}
+		if tool.bind != nil {
 			tool = tool.bind(binding)
 		}
 		tools = append(tools, tool)
@@ -184,7 +169,7 @@ func (agent *Agent) currentTools() []Tool {
 	if slices.Contains(agent.ToolNames, "create_tool") {
 		for _, plugin := range agent.plugins {
 			for _, definition := range plugin.Binary.Definitions {
-				tools = append(tools, binaryTool(plugin.Binary, definition).bind(binding))
+				tools = append(tools, binaryTool(plugin.Binary, definition))
 			}
 		}
 	}
