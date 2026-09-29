@@ -210,10 +210,11 @@ func TestRuntimeToolSelection(t *testing.T) {
 		return data
 	}
 	var catalog []ToolSummary
-	if err := json.Unmarshal(request("GET", "/tools", "", 200), &catalog); err != nil || len(catalog) != 2 || catalog[0].Name != "create_agent" || catalog[1].Name != "get_time" {
+	if err := json.Unmarshal(request("GET", "/tools", "", 200), &catalog); err != nil || len(catalog) != 3 || catalog[0].Name != "create_agent" || catalog[1].Name != "create_tool" || catalog[2].Name != "get_time" {
 		t.Fatalf("tool catalog: %+v %v", catalog, err)
 	}
 	request("POST", "/environments/tools", "", 201)
+	request("POST", "/tools/reload", "", 200)
 	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message", "assignable_tool=missing", "assignable_tool=get_time&assignable_tool=get_time", "assignable_tool=message", "allowed_model=missing", "allowed_model=test-model&allowed_model=test-model"} {
 		request("POST", "/environments/tools/agents/assistant?model=test-model&"+query, "", 400)
 	}

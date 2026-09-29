@@ -2,9 +2,10 @@
 
 ## Terminal interface
 
-Start the runtime in one terminal:
+Build the bundled tool plugin, then start the runtime in one terminal:
 
 ```sh
+go build -o plugins/bin/builtin ./cmd/micro-tools
 go run main.go serve
 ```
 
@@ -149,28 +150,138 @@ All assignable tools must also be in the registry used to restore the environmen
 
 ## Tool architecture
 
-- `api/tool.go` defines tool schemas, JSON argument handling, and `ToolContext`:
-  the environment, runtime-bound caller, assignable tools, and child-model limits.
-- `api/tool_catalog.go` owns `DefaultTools()`, automatic/optional classification,
-  optional-tool discovery, name resolution, and caller binding. `Optional()` feeds
-  the UI catalogue, `Resolve()` validates selectable names, and `Bind()` adds the
-  automatic tools and binds explicitly selected tools without mutating shared
-  definitions. Automatic tools cannot be selected as optional Use or Assign tools.
-- `api/tools_agents.go`, `api/tools_memory.go`, and `api/tools_time.go` contain the
-  model-facing adapters. They describe and decode calls, invoke ordinary operations,
-  and encode results; they do not manage inbox workers or persistence.
-- `AgentEnvironment.CreateChildAgent` owns child-creation authorization and performs
-  permission checks and creation under one lock. `SendAgentMessage`, `AgentNames`,
-  `Status`, and the memory store operations are usable without model tool calls.
-  Caller identity comes from the bound context, never model-provided arguments.
-- The agent loop offers only its bound Use tools, checks requested names against
-  that set, executes calls, and records results. Current child model/tool grants
-  are rechecked by the environment operation, so stale bindings cannot bypass
-  revocation. Schema permissions are snapshots refreshed when tools are rebound.
+All runtime catalogue tools execute as binary plugins, including memory,
+messaging, agent creation, time, and tool creation. The built-ins ship together
+in one executable, built from [cmd/micro-tools/main.go](cmd/micro-tools/main.go).
+There is no Go `.so` loading or Python runner.
 
-Tool names and permission fields in saved environments are unchanged. The old
-`BuiltinTools()` and `MemoryTools()` factories are replaced by the shared catalogue;
-there is no separate registration step for `create_agent`.
+- [toolplugin/plugin.go](toolplugin/plugin.go) is the stdlib-only SDK and the
+  authoritative version-1 wire contract: `Definition`, `Parameter`, `Manifest`,
+  `Request`, `Response`, `Tool`, `Handler`, and `Serve`.
+- [toolplugin/builtin/tools.go](toolplugin/builtin/tools.go) owns built-in tool
+  definitions and plugin-side handlers. Stateful operations use a private,
+  per-invocation Unix socket. Only that built-in's operation is exposed; the
+  host supplies caller identity and conversation metadata and checks grants.
+  External and agent-created plugins receive no host socket.
+- [api/plugins.go](api/plugins.go) contains the central subprocess launcher for
+  builds, discovery, and calls, and the host operation bridge. Agent state,
+  queues, memory, persistence, and authorization remain in the runtime.
+- [api/plugin_catalog.go](api/plugin_catalog.go) validates manifests and takes
+  immutable executable snapshots. [api/tool_catalog.go](api/tool_catalog.go)
+  retains Use/Assign selection and caller binding. Tools are refreshed before
+  each invocation and model call, without changing an agent's grants.
+
+Existing built-in names and permission fields are unchanged. `DefaultTools()`
+now returns binary-backed definitions, including optional `create_tool`.
+Direct Go callers must also build the bundled executable. Trusted custom Go
+`Tool` values remain supported by the Go API, but are not a runtime plugin
+installation mechanism.
+
+## Plugin contract
+
+Start from [examples/echo/main.go](examples/echo/main.go). Define a
+`toolplugin.Tool` with a `Definition` and `Call func(json.RawMessage)
+(string, error)`, optionally using `toolplugin.Handler` for typed arguments.
+Call `toolplugin.Serve` from `main`; print startup failures to stderr and exit
+nonzero. The SDK supplies both commands below. A plugin does not import `api`.
+
+`plugin describe` takes no input and returns exactly one JSON object:
+
+```json
+{"protocol_version":1,"tools":[{"name":"echo","description":"Return text","parameters":[{"name":"input","type":"string","description":"Text","required":true}]}]}
+```
+
+`plugin call echo` reads exactly one JSON object from stdin until EOF:
+
+```json
+{"protocol_version":1,"arguments":{"input":"hello"}}
+```
+
+It writes exactly one JSON response to stdout, with exit status zero:
+
+```json
+{"protocol_version":1,"result":"hello"}
+```
+
+An application error uses `{"protocol_version":1,"result":"","error":"message"}`.
+Nonzero exits, invalid JSON, unsupported versions, output overflow, and timeouts
+are tool failures. `code` is reserved for host-operation error classification.
+Stdout is protocol-only; diagnostics belong on stderr. There is no streaming,
+long-lived plugin process, or plugin-selected caller identity.
+
+Names match `[a-z][a-z0-9_]{0,63}`. A manifest contains 1-64 distinct tools with
+nonempty descriptions (max 8192 bytes). Parameters use `string`, `integer`,
+`number`, `boolean`, or `array` with primitive `items`. `enum` is supported for
+strings. Nested object schemas are not supported in this version. Only the
+bundled plugin may declare `automatic: true`. Duplicate names reject discovery.
+
+## Install and reload
+
+Build binaries for the runtime's OS and architecture. For the example:
+
+```sh
+go build -o plugins/bin/.echo-new ./examples/echo
+mv plugins/bin/.echo-new plugins/bin/echo
+go run main.go plugins reload
+```
+
+The runtime scans `plugins/bin` at startup; `serve --plugins <directory>` changes
+the additional-plugin directory. `MICRO_BUILTIN_PLUGIN` overrides the bundled
+executable path independently. Hidden files and directories are ignored. Other
+entries must be executable regular files. Build to a hidden temporary filename
+and rename into place, never overwrite a live executable in place.
+
+Reload is also available as `POST /tools/reload`. It validates the whole candidate
+catalogue before publishing it; failures preserve the active catalogue. New
+tools appear in the agent form's Use/Assign picker when reopened, but are never
+automatically granted. Replacements apply to subsequent calls; invocations
+already holding a snapshot keep the old binary. Snapshots are retained until
+runtime shutdown. Removing a binary and reloading removes its tools from calls
+without erasing grants. Before restarting, restore missing binaries or remove
+their grants: startup fails if saved agents require absent registered tools.
+
+## Agent-created plugins
+
+Enable Use for `create_tool` on a trusted agent. It accepts `name`, `source`
+(a complete Go main package, max 64 KiB), `test_arguments` (a JSON object encoded
+as a string), and `expected_output` (the exact result string). It builds against
+the runtime's embedded copy of the same SDK, validates `describe`, and runs a
+sample `call` before registering exactly one tool. The example above works
+unchanged as `source`. Only the standard library and the SDK are available;
+module downloads, CGO, workspace overrides, and automatic toolchain downloads
+are disabled. A local Go 1.25+ toolchain is required for creation.
+
+The creating agent can invoke its tool immediately, even in the same tool-call
+batch. Definitions, source, and binaries persist under the environment's
+`plugins` directory. Saved agent state references the installed directory;
+startup runs `describe`, not the sample call, to restore its schema. Missing or
+invalid private binaries fail restoration. Tools remain private and cannot be
+assigned to children. Editing an agent preserves them; unchecking Use for
+`create_tool` disables both creation and use of its private plugins. Re-enabling
+it restores access. Individual replacement, deletion, and sharing of private
+plugins are not implemented. Failed samples and failed state saves do not
+register a tool, though any effects of executing the sample cannot be undone.
+
+## Execution and sandboxing
+
+**Plugins are not sandboxed yet.** Discovery, compilation, sample tests, and
+normal calls execute with the runtime user's OS access. Grant creation only to
+trusted agents and install only trusted binaries. A restricted environment and
+temporary working directory are not security boundaries; plugins can access
+files, networks, and processes, including secrets on disk.
+
+Calls use a fresh temporary working directory and receive only PATH and LANG,
+plus the invocation socket for stateful built-ins. Compilation also receives
+HOME and the Go build-cache path. Model API key environment variables are not
+passed. Requests are limited to 128 KiB; stdout and stderr each to 1 MiB.
+Discovery has a 10-second timeout, calls 30 seconds, compilation 90 seconds,
+and the enclosing `create_tool` operation 120 seconds. Cancellation kills the
+direct process; there are no memory, CPU, or descendant-process guarantees.
+
+Nono is intentionally not integrated yet. The central launcher is the place to
+wrap all execution stages with host-selected policies later, with no plugin
+contract changes. The host socket still needs separate authorization because
+sandbox restrictions on a child do not restrict operations performed by its host.
 
 ## Delivery and recovery
 

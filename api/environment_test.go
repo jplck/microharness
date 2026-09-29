@@ -31,7 +31,7 @@ func TestToolCatalogueBinding(t *testing.T) {
 	ctx, root, _ := setupPersistenceTest(t)
 	registry := DefaultTools()
 	optional := registry.Optional()
-	if len(optional) != 2 || optional[0].Name != "create_agent" || optional[1].Name != "get_time" {
+	if len(optional) != 3 || optional[0].Name != "create_agent" || optional[1].Name != "create_tool" || optional[2].Name != "get_time" {
 		t.Fatalf("unexpected optional tools: %+v", optional)
 	}
 	for _, name := range []string{"search_memory", "write_memory", "update_memory", "message", "list_agents", "agent_status"} {

@@ -25,6 +25,8 @@ type Envelope struct {
 }
 
 type Agent struct {
+	environment         *AgentEnvironment
+	plugins             []ownedPlugin
 	runMu               sync.Mutex
 	inboxWake           chan struct{}
 	Client              ModelCall
@@ -114,8 +116,11 @@ func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, too
 		return ErrAgentBusy
 	}
 	binding := ToolContext{Environment: env, Caller: name, AssignableTools: agent.AssignableTools, AllowedModels: agent.AllowedModels}
-	resolved, names, err := DefaultTools().Bind(binding, tools)
+	resolved, names, err := env.toolRegistryLocked().Bind(binding, tools)
 	if err != nil {
+		return err
+	}
+	if err := checkPrivatePluginNames(agent, env.toolRegistryLocked(), resolved...); err != nil {
 		return err
 	}
 	previousTools, previousNames := agent.Tools, agent.ToolNames
@@ -165,9 +170,12 @@ func (env *AgentEnvironment) UpdateAgentWithModels(ctx context.Context, name, mo
 		return err
 	}
 	binding := ToolContext{Environment: env, Caller: name, AssignableTools: assignableTools, AllowedModels: allowedModels}
-	registry := DefaultTools()
+	registry := env.toolRegistryLocked()
 	resolved, names, err := registry.Bind(binding, tools)
 	if err != nil {
+		return err
+	}
+	if err := checkPrivatePluginNames(agent, registry, resolved...); err != nil {
 		return err
 	}
 	previousSession := agent.Session
@@ -251,7 +259,7 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 		return nil, err
 	}
 	binding := ToolContext{Environment: env, Caller: name, AssignableTools: assignableTools, AllowedModels: allowedModels}
-	registry := DefaultTools()
+	registry := env.toolRegistryLocked()
 	tools, toolNames, err := registry.Bind(binding, tools)
 	if err != nil {
 		return nil, err
@@ -277,6 +285,7 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 	}
 
 	agent := &Agent{
+		environment:         env,
 		Client:              client,
 		Tools:               tools,
 		ToolNames:           toolNames,
@@ -328,10 +337,6 @@ func (a *Agent) executeEnvelope(ctx context.Context, envelope Envelope) error {
 }
 
 func (a *Agent) continueTurn(ctx context.Context) (Message, error) {
-	tools := make(map[string]Tool, len(a.Tools))
-	for _, tool := range a.Tools {
-		tools[tool.Name] = tool
-	}
 	for step := 0; step < 10; step++ {
 		if err := ctx.Err(); err != nil {
 			return Message{}, err
@@ -350,9 +355,15 @@ func (a *Agent) continueTurn(ctx context.Context) (Message, error) {
 				if err := ctx.Err(); err != nil {
 					return Message{}, err
 				}
-				tool, ok := tools[call.Name]
+				var tool Tool
+				for _, candidate := range a.currentTools() {
+					if candidate.Name == call.Name {
+						tool = candidate
+						break
+					}
+				}
 				output := fmt.Sprintf("Tool error: tool %q not found", call.Name)
-				if ok {
+				if tool.Execute != nil {
 					var err error
 					output, err = tool.Execute(ctx, call.Arguments)
 					if ctx.Err() != nil {
@@ -367,7 +378,7 @@ func (a *Agent) continueTurn(ctx context.Context) (Message, error) {
 				}
 			}
 		}
-		resp, err := a.Client.Call(ctx, a.Session.Messages, a.Tools)
+		resp, err := a.Client.Call(ctx, a.Session.Messages, a.currentTools())
 		if err != nil {
 			return Message{}, fmt.Errorf("call client: %w", err)
 		}

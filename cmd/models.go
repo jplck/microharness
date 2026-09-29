@@ -38,6 +38,15 @@ var listModelsCmd = &cobra.Command{
 }
 
 var socketPath string
+var pluginDirectory string
+
+var pluginsCmd = &cobra.Command{Use: "plugins", Short: "Manage binary tool plugins"}
+var pluginsReloadCmd = &cobra.Command{
+	Use: "reload", Short: "Validate and reload binary tools without restarting", Args: cobra.NoArgs,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runtimeRequest(cmd, http.MethodPost, "/tools/reload", nil)
+	},
+}
 
 var environmentCreateAgentCmd = &cobra.Command{
 	Use:   "create-agent <environment> <name> <model>",
@@ -167,7 +176,7 @@ var serveCmd = &cobra.Command{
 	RunE: func(cmd *cobra.Command, args []string) error {
 		ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		return api.ServeRuntime(ctx, socketPath, "./data")
+		return api.ServeRuntime(ctx, socketPath, "./data", pluginDirectory)
 	},
 }
 
@@ -175,6 +184,9 @@ func init() {
 	rootCmd.PersistentFlags().StringVar(&socketPath, "socket", "/tmp/micro.sock", "Runtime Unix socket")
 	rootCmd.AddCommand(listModelsCmd)
 	rootCmd.AddCommand(serveCmd)
+	serveCmd.Flags().StringVar(&pluginDirectory, "plugins", "plugins/bin", "Directory of executable tool plugins")
+	pluginsCmd.AddCommand(pluginsReloadCmd)
+	rootCmd.AddCommand(pluginsCmd)
 	environmentCreateAgentCmd.Flags().String("instructions", "", "Agent-specific instructions added to the default system prompt")
 	environmentCmd.AddCommand(environmentCreateCmd, environmentListCmd, environmentCreateAgentCmd)
 	environmentMessageCmd.Flags().String("sender", "cli", "External sender identity")

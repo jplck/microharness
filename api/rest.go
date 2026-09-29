@@ -16,15 +16,57 @@ import (
 	"time"
 )
 
-func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
+func ServeRuntime(ctx context.Context, socketPath, dataRoot string, pluginDirectories ...string) error {
 	var mu sync.Mutex
-	registry := DefaultTools()
+	pluginDirectory := "plugins/bin"
+	if len(pluginDirectories) > 0 {
+		pluginDirectory = pluginDirectories[0]
+	}
+	registry, cache, err := loadPluginCatalogue(ctx, pluginDirectory)
+	if err != nil {
+		return err
+	}
+	caches := []string{cache}
+	defer func() {
+		for _, directory := range caches {
+			os.RemoveAll(directory)
+		}
+	}()
 	environments, err := loadAgentEnvironments(ctx, dataRoot, registry)
 	if err != nil {
 		return err
 	}
 	mux := http.NewServeMux()
+	currentRegistry := func() ToolRegistry { mu.Lock(); defer mu.Unlock(); return registry }
 	mux.HandleFunc("GET /tools", func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, http.StatusOK, currentRegistry().Optional())
+	})
+	mux.HandleFunc("POST /tools/reload", func(w http.ResponseWriter, r *http.Request) {
+		replacement, directory, err := loadPluginCatalogue(r.Context(), pluginDirectory)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		for _, env := range environments {
+			env.mu.Lock()
+			defer env.mu.Unlock()
+		}
+		for _, env := range environments {
+			for _, agent := range env.Agents {
+				if err := checkPrivatePluginNames(agent, replacement); err != nil {
+					os.RemoveAll(directory)
+					http.Error(w, err.Error(), http.StatusConflict)
+					return
+				}
+			}
+		}
+		for _, env := range environments {
+			env.registry = replacement
+		}
+		registry = replacement
+		caches = append(caches, directory)
 		writeJSONResponse(w, http.StatusOK, registry.Optional())
 	})
 	handleEnvironment := func(pattern string, handler func(http.ResponseWriter, *http.Request, *AgentEnvironment)) {
@@ -121,12 +163,13 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	for _, method := range []string{http.MethodPost, http.MethodPut} {
 		handleEnvironment(method+" /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 			name := r.PathValue("name")
-			tools, err := registry.Resolve(r.URL.Query()["tool"])
+			snapshot := currentRegistry()
+			tools, err := snapshot.Resolve(r.URL.Query()["tool"])
 			if err != nil {
 				writeMessagingError(w, err)
 				return
 			}
-			assignableTools, err := registry.Resolve(r.URL.Query()["assignable_tool"])
+			assignableTools, err := snapshot.Resolve(r.URL.Query()["assignable_tool"])
 			if err != nil {
 				writeMessagingError(w, err)
 				return
@@ -159,7 +202,7 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			http.Error(w, "expected one JSON array", http.StatusBadRequest)
 			return
 		}
-		tools, err := registry.Resolve(names)
+		tools, err := currentRegistry().Resolve(names)
 		if err == nil {
 			err = env.SetAgentTools(r.Context(), r.PathValue("name"), tools)
 		}
@@ -191,6 +234,7 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			http.Error(w, "cannot create environment", http.StatusInternalServerError)
 			return
 		}
+		env.registry = registry
 		if err := env.Start(ctx); err != nil {
 			http.Error(w, "cannot start environment", http.StatusServiceUnavailable)
 			return

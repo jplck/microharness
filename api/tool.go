@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/jplck/micro/toolplugin"
+
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/shared"
 )
 
-type ParameterType string
+type ParameterType = toolplugin.ParameterType
 
 const (
 	String  ParameterType = "string"
@@ -19,14 +21,7 @@ const (
 	Array   ParameterType = "array"
 )
 
-type Parameter struct {
-	Name        string        `json:"name"`
-	Type        ParameterType `json:"type"`
-	Description string        `json:"description"`
-	Required    bool          `json:"required"`
-	Items       ParameterType `json:"items,omitempty"`
-	Enum        []string      `json:"enum,omitempty"`
-}
+type Parameter = toolplugin.Parameter
 
 type ToolContext struct {
 	Environment     *AgentEnvironment
@@ -36,6 +31,7 @@ type ToolContext struct {
 }
 
 type Tool struct {
+	plugin      *pluginBinary
 	bind        func(ToolContext) Tool
 	Automatic   bool
 	Name        string

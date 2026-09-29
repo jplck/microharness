@@ -46,7 +46,15 @@ func (env *AgentEnvironment) CreateChildAgent(ctx context.Context, caller string
 		if index < 0 {
 			return nil, fmt.Errorf("%w: caller cannot assign %q", ErrInvalidTool, name)
 		}
-		tools = append(tools, parent.AssignableTools[index])
+		tool := parent.AssignableTools[index]
+		if tool.plugin != nil && env.registry != nil {
+			var exists bool
+			tool, exists = env.registry[name]
+			if !exists {
+				return nil, fmt.Errorf("%w: plugin %q is unavailable", ErrInvalidTool, name)
+			}
+		}
+		tools = append(tools, tool)
 	}
 	var childModels []string
 	if slices.Contains(request.Tools, "create_agent") {

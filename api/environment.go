@@ -15,6 +15,7 @@ import (
 var validStateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type AgentEnvironment struct {
+	registry     ToolRegistry
 	mu           sync.Mutex
 	workerCtx    context.Context
 	workerCancel context.CancelFunc
@@ -45,6 +46,7 @@ type AgentState struct {
 	ToolNames           []string   `json:"tools,omitempty"`
 	AssignableToolNames []string   `json:"assignable_tools,omitempty"`
 	AllowedModels       []string   `json:"allowed_models,omitempty"`
+	Plugins             []string   `json:"plugins,omitempty"`
 	Inbox               []Envelope `json:"inbox,omitempty"`
 	InboxError          string     `json:"inbox_error,omitempty"`
 	NotifiedFailures    []string   `json:"notified_failures,omitempty"`
@@ -101,6 +103,7 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 	store.EmbeddingModel = state.EmbeddingModel
 	env := &AgentEnvironment{
 		Agents: make([]*Agent, 0, len(state.Agents)), MemoryStore: store,
+		registry: registry,
 		DataRoot: directory, ID: state.ID, Name: state.Name,
 	}
 	seen := make(map[string]bool)
@@ -120,6 +123,19 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID, saved.AllowedModels, assignableTools...)
 		if err != nil {
 			return nil, fmt.Errorf("restore agent %q: %w", saved.Name, err)
+		}
+		for _, name := range saved.Plugins {
+			if !validStateName.MatchString(name) {
+				return nil, fmt.Errorf("invalid saved plugin path %q", name)
+			}
+			binary, err := readPlugin(ctx, filepath.Join(directory, "plugins", name, "tool"), false)
+			if err != nil {
+				return nil, fmt.Errorf("restore agent %q plugin: %w", saved.Name, err)
+			}
+			agent.plugins = append(agent.plugins, ownedPlugin{Path: name, Binary: binary})
+		}
+		if err := checkPrivatePluginNames(agent, env.toolRegistryLocked()); err != nil {
+			return nil, err
 		}
 		agent.Inbox = saved.Inbox
 		agent.InboxError = saved.InboxError
@@ -145,6 +161,10 @@ func (env *AgentEnvironment) saveLocked() error {
 		state.InitialAgentName = env.InitialAgent.Name
 	}
 	for _, agent := range env.Agents {
+		plugins := make([]string, 0, len(agent.plugins))
+		for _, plugin := range agent.plugins {
+			plugins = append(plugins, plugin.Path)
+		}
 		state.Agents = append(state.Agents, AgentState{
 			Name: agent.Name, ModelName: agent.ModelName, Instructions: agent.Instructions,
 			SessionID: agent.Session.SessionID, ToolNames: agent.ToolNames, Inbox: agent.Inbox,
@@ -152,6 +172,7 @@ func (env *AgentEnvironment) saveLocked() error {
 			NotifiedFailures:    agent.notifiedFailures,
 			AssignableToolNames: agent.AssignableToolNames,
 			AllowedModels:       agent.AllowedModels,
+			Plugins:             plugins,
 		})
 	}
 	if err := writeJSONAtomic(filepath.Join(env.DataRoot, "environment.json"), state); err != nil {

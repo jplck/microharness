@@ -58,12 +58,7 @@ func TestReplyRoutingInstructions(t *testing.T) {
 	if !setSessionInstructions(&session, custom) {
 		t.Fatal("existing session instructions were not refreshed")
 	}
-	var description string
-	for _, tool := range messagingTools() {
-		if tool.Name == "message" {
-			description = tool.Description
-		}
-	}
+	description := DefaultTools()["message"].Description
 	for name, text := range map[string]string{"system": session.Messages[0].Content, "message": description} {
 		for _, rule := range []string{
 			`When Source is "agent", send substantive replies`,

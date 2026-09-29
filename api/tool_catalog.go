@@ -3,21 +3,21 @@ package api
 import (
 	"fmt"
 	"slices"
+
+	"github.com/jplck/micro/toolplugin/builtin"
 )
 
 type ToolRegistry map[string]Tool
 
 func DefaultTools() ToolRegistry {
 	registry := ToolRegistry{}
-	for _, tool := range append(memoryTools(), messagingTools()...) {
-		tool.Automatic = true
-		registry[tool.Name] = tool
-	}
-	for _, tool := range []Tool{timeTool(), CreateAgentTool()} {
-		registry[tool.Name] = tool
+	for _, tool := range builtin.Tools() {
+		registry[tool.Name] = binaryTool(&pluginBinary{Path: builtinPluginPath(), Builtin: true}, tool.Definition)
 	}
 	return registry
 }
+
+func CreateAgentTool() Tool { return DefaultTools()["create_agent"] }
 
 func (registry ToolRegistry) Optional() []ToolSummary {
 	names := make([]string, 0, len(registry))
