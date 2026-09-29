@@ -289,72 +289,32 @@ func (env *AgentEnvironment) RetryInbox(ctx context.Context, name string) error 
 	return nil
 }
 
-func (env *AgentEnvironment) messagingTools(sender string) []Tool {
-	return []Tool{
-		{
-			Name:        "agent_status",
-			Description: "Inspect an agent's idle, queued, running, or paused status, pending count, active envelope ID, and error. Check this before sending reminders. A paused inbox requires an operator retry; more messages do not resume it.",
-			Parameters:  []Parameter{{Name: "name", Type: String, Description: "Agent name to inspect", Required: true}},
-			Execute: JSONHandler(func(ctx context.Context, arguments struct {
-				Name string `json:"name"`
-			}) (string, error) {
-				status, err := env.Status(arguments.Name)
-				if err != nil {
-					return "", err
-				}
-				data, err := json.Marshal(status)
-				return string(data), err
-			}),
-		},
-		{
-			Name: "list_agents", Description: "List agent names in this environment that can receive messages.",
-			Execute: JSONHandler(func(ctx context.Context, arguments struct{}) (string, error) {
-				env.mu.Lock()
-				defer env.mu.Unlock()
-				names := make([]string, 0, len(env.Agents))
-				for _, agent := range env.Agents {
-					names = append(names, agent.Name)
-				}
-				slices.Sort(names)
-				data, err := json.Marshal(names)
-				return string(data), err
-			}),
-		},
-		{
-			Name:        "message",
-			Description: "Queue a message to another existing agent and return its accepted ID plus a recipient status snapshot, not an answer or task completion. A paused recipient cannot process it until an operator retries its inbox. Use agent_status before sending reminders. Replies and runtime failure notices arrive as separate inbox turns. When Source is \"agent\", send substantive replies to the incoming envelope's Sender and set reply_to to its ID. When Source is not \"agent\", reply with normal assistant text; client labels such as \"tui\" or \"user\" and the runtime are not agent recipients. You may still delegate work to existing agents. Do not send acknowledgement-only replies or wait for another agent in this turn.",
-			Parameters: []Parameter{
-				{Name: "to", Type: String, Description: "Recipient agent name", Required: true},
-				{Name: "content", Type: String, Description: "Message content", Required: true},
-				{Name: "reply_to", Type: String, Description: "Envelope ID being answered, or empty for a new message"},
-			},
-			Execute: JSONHandler(func(ctx context.Context, arguments struct {
-				To      string `json:"to"`
-				Content string `json:"content"`
-				ReplyTo string `json:"reply_to"`
-			}) (string, error) {
-				if arguments.To == "" {
-					return "", fmt.Errorf("%w: recipient is required", ErrInvalidEnvelope)
-				}
-				incoming, _ := ctx.Value(envelopeContextKey{}).(Envelope)
-				id, err := env.Message(ctx, Envelope{
-					Source: "agent", Sender: sender, To: arguments.To, Content: arguments.Content,
-					ReplyTo: arguments.ReplyTo, ConversationID: incoming.ConversationID,
-				})
-				if err != nil {
-					return "", err
-				}
-				status, err := env.Status(arguments.To)
-				if err != nil {
-					return "", err
-				}
-				data, err := json.Marshal(struct {
-					ID        string      `json:"id"`
-					Status    string      `json:"status"`
-					Recipient AgentStatus `json:"recipient"`
-				}{id, "accepted", status})
-				return string(data), err
-			}),
-		},
+func (env *AgentEnvironment) AgentNames() []string {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	names := make([]string, 0, len(env.Agents))
+	for _, agent := range env.Agents {
+		names = append(names, agent.Name)
 	}
+	slices.Sort(names)
+	return names
+}
+
+type MessageReceipt struct {
+	ID        string      `json:"id"`
+	Status    string      `json:"status"`
+	Recipient AgentStatus `json:"recipient"`
+}
+
+func (env *AgentEnvironment) SendAgentMessage(ctx context.Context, caller string, envelope Envelope) (MessageReceipt, error) {
+	if envelope.To == "" {
+		return MessageReceipt{}, fmt.Errorf("%w: recipient is required", ErrInvalidEnvelope)
+	}
+	envelope.Source, envelope.Sender = "agent", caller
+	id, err := env.Message(ctx, envelope)
+	if err != nil {
+		return MessageReceipt{}, err
+	}
+	status, err := env.Status(envelope.To)
+	return MessageReceipt{ID: id, Status: "accepted", Recipient: status}, err
 }

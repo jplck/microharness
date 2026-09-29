@@ -91,28 +91,6 @@ func (env *AgentEnvironment) createAgentLocked(ctx context.Context, modelName st
 	return agent, nil
 }
 
-func (env *AgentEnvironment) agentTools(ctx context.Context, name string, tools []Tool, allowedModels []string, assignableTools ...Tool) ([]Tool, []string, error) {
-	builtins := MemoryTools(ctx, env.MemoryStore)
-	builtins = append(builtins, env.messagingTools(name)...)
-	toolNames := make([]string, 0, len(tools))
-	seen := make(map[string]bool)
-	for _, tool := range builtins {
-		seen[tool.Name] = true
-	}
-	for _, tool := range tools {
-		if tool.bindEnvironment != nil {
-			tool = tool.bindEnvironment(env, name, assignableTools, allowedModels)
-		}
-		if tool.Name == "" || tool.Execute == nil || seen[tool.Name] {
-			return nil, nil, fmt.Errorf("%w %q", ErrInvalidTool, tool.Name)
-		}
-		seen[tool.Name] = true
-		toolNames = append(toolNames, tool.Name)
-		builtins = append(builtins, tool)
-	}
-	return builtins, toolNames, nil
-}
-
 func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, tools []Tool) error {
 	env.mu.Lock()
 	agent := env.agentLocked(name)
@@ -135,7 +113,8 @@ func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, too
 	if len(agent.Inbox) > 0 {
 		return ErrAgentBusy
 	}
-	resolved, names, err := env.agentTools(ctx, name, tools, agent.AllowedModels, agent.AssignableTools...)
+	binding := ToolContext{Environment: env, Caller: name, AssignableTools: agent.AssignableTools, AllowedModels: agent.AllowedModels}
+	resolved, names, err := DefaultTools().Bind(binding, tools)
 	if err != nil {
 		return err
 	}
@@ -185,12 +164,14 @@ func (env *AgentEnvironment) UpdateAgentWithModels(ctx context.Context, name, mo
 	if err := validateAllowedModels(allowedModels); err != nil {
 		return err
 	}
-	resolved, names, err := env.agentTools(ctx, name, tools, allowedModels, assignableTools...)
+	binding := ToolContext{Environment: env, Caller: name, AssignableTools: assignableTools, AllowedModels: allowedModels}
+	registry := DefaultTools()
+	resolved, names, err := registry.Bind(binding, tools)
 	if err != nil {
 		return err
 	}
 	previousSession := agent.Session
-	_, assignableNames, err := env.agentTools(ctx, name, assignableTools, allowedModels)
+	_, assignableNames, err := registry.Bind(binding, assignableTools)
 	if err != nil {
 		return err
 	}
@@ -269,13 +250,15 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 	if err != nil {
 		return nil, err
 	}
-	tools, toolNames, err := env.agentTools(ctx, name, tools, allowedModels, assignableTools...)
+	binding := ToolContext{Environment: env, Caller: name, AssignableTools: assignableTools, AllowedModels: allowedModels}
+	registry := DefaultTools()
+	tools, toolNames, err := registry.Bind(binding, tools)
 	if err != nil {
 		return nil, err
 	}
 
 	session := Session{SessionID: sessionID, Scope: filepath.Join(env.DataRoot, "Sessions")}
-	_, assignableNames, err := env.agentTools(ctx, name, assignableTools, allowedModels)
+	_, assignableNames, err := registry.Bind(binding, assignableTools)
 	if err != nil {
 		return nil, err
 	}

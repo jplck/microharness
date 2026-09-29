@@ -28,17 +28,36 @@ type Parameter struct {
 	Enum        []string      `json:"enum,omitempty"`
 }
 
+type ToolContext struct {
+	Environment     *AgentEnvironment
+	Caller          string
+	AssignableTools []Tool
+	AllowedModels   []string
+}
+
 type Tool struct {
-	bindEnvironment func(*AgentEnvironment, string, []Tool, []string) Tool
-	Name            string
-	Description     string
-	Parameters      []Parameter
-	Execute         func(context.Context, json.RawMessage) (string, error)
+	bind        func(ToolContext) Tool
+	Automatic   bool
+	Name        string
+	Description string
+	Parameters  []Parameter
+	Execute     func(context.Context, json.RawMessage) (string, error)
 }
 
 type ToolSummary struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+}
+
+func contextTool[T any](definition Tool, handler func(context.Context, ToolContext, T) (string, error)) Tool {
+	definition.bind = func(binding ToolContext) Tool {
+		bound := definition
+		bound.Execute = JSONHandler(func(ctx context.Context, arguments T) (string, error) {
+			return handler(ctx, binding, arguments)
+		})
+		return bound
+	}
+	return definition
 }
 
 func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {

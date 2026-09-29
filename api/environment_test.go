@@ -27,6 +27,73 @@ func setupPersistenceTest(t *testing.T) (context.Context, string, ToolRegistry) 
 	return t.Context(), t.TempDir(), registry
 }
 
+func TestToolCatalogueBinding(t *testing.T) {
+	ctx, root, _ := setupPersistenceTest(t)
+	registry := DefaultTools()
+	optional := registry.Optional()
+	if len(optional) != 2 || optional[0].Name != "create_agent" || optional[1].Name != "get_time" {
+		t.Fatalf("unexpected optional tools: %+v", optional)
+	}
+	for _, name := range []string{"search_memory", "write_memory", "update_memory", "message", "list_agents", "agent_status"} {
+		if !registry[name].Automatic {
+			t.Fatalf("%s not automatic", name)
+		}
+		if _, err := registry.Resolve([]string{name}); !errors.Is(err, ErrInvalidTool) {
+			t.Fatalf("automatic tool selectable: %s %v", name, err)
+		}
+	}
+	if _, err := registry.Resolve([]string{"missing"}); !errors.Is(err, ErrInvalidTool) {
+		t.Fatal("unknown tool resolved")
+	}
+	if _, _, err := registry.Bind(ToolContext{}, nil); !errors.Is(err, ErrInvalidTool) {
+		t.Fatal("missing caller context accepted")
+	}
+	first, err := NewAgentEnvironment(ctx, root, "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := NewAgentEnvironment(ctx, root, "second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, env := range []*AgentEnvironment{first, second} {
+		for _, name := range []string{"caller", "recipient"} {
+			if _, err := env.CreateAgent(ctx, "test-model", nil, name, "", false); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, env := range []*AgentEnvironment{first, second} {
+		tools, names, err := registry.Bind(ToolContext{Environment: env, Caller: "caller"}, nil)
+		if err != nil || len(tools) != 6 || len(names) != 0 {
+			t.Fatalf("automatic binding: %v %v", names, err)
+		}
+		for _, tool := range tools {
+			if !tool.Automatic {
+				t.Fatalf("bound tool lost automatic classification: %s", tool.Name)
+			}
+			if registry[tool.Name].Execute != nil {
+				t.Fatal("binding mutated shared definition")
+			}
+			if tool.Name == "message" {
+				callCtx := context.WithValue(ctx, envelopeContextKey{}, Envelope{ConversationID: env.Name})
+				if _, err := tool.Execute(callCtx, json.RawMessage(`{"to":"recipient","content":"work","sender":"spoofed","conversation_id":"spoofed"}`)); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+	}
+	for _, env := range []*AgentEnvironment{first, second} {
+		inbox, err := env.Inbox("recipient")
+		if err != nil || len(inbox.Messages) != 1 || inbox.Messages[0].Sender != "caller" || inbox.Messages[0].ConversationID != env.Name {
+			t.Fatalf("caller/environment isolation failed: %+v %v", inbox, err)
+		}
+	}
+	if _, err := first.CreateChildAgent(ctx, "caller", ChildAgentRequest{Name: "denied", Model: "test-model"}); !errors.Is(err, ErrInvalidTool) {
+		t.Fatalf("domain operation bypassed creation permission: %v", err)
+	}
+}
+
 func TestCreateAgentTool(t *testing.T) {
 	ctx, root, registry := setupPersistenceTest(t)
 	registry["create_agent"] = CreateAgentTool()
@@ -99,8 +166,8 @@ func TestCreateAgentTool(t *testing.T) {
 	if len(loaded.Agents) != 3 || len(env.Agents) != 2 {
 		t.Fatal("restored tool bound to wrong environment")
 	}
-	if _, ok := BuiltinTools()["create_agent"]; ok {
-		t.Fatal("creation tool registered as a default builtin")
+	if DefaultTools()["create_agent"].Automatic {
+		t.Fatal("creation tool registered as automatic")
 	}
 	models, err := ListModels()
 	if err != nil {
@@ -127,7 +194,7 @@ func TestCreateAgentTool(t *testing.T) {
 
 func TestCreateAgentToolAssignments(t *testing.T) {
 	ctx, root, registry := setupPersistenceTest(t)
-	registry["create_agent"], registry["get_time"] = CreateAgentTool(), BuiltinTools()["get_time"]
+	registry["create_agent"], registry["get_time"] = CreateAgentTool(), DefaultTools()["get_time"]
 	env, err := NewAgentEnvironment(ctx, root, "team")
 	if err != nil {
 		t.Fatal(err)
@@ -358,7 +425,7 @@ func TestSetAgentTools(t *testing.T) {
 	if !reflect.DeepEqual(loaded.Agents[0].ToolNames, []string{"echo"}) || loaded.Agents[0].Session.SessionID != sessionID || loaded.Agents[0].Instructions != "Keep instructions" {
 		t.Fatal("tool edit lost configuration or did not persist")
 	}
-	for _, tools := range [][]Tool{{registry["echo"], registry["echo"]}, {{Name: "invalid"}}, {MemoryTools(ctx, env.MemoryStore)[0]}} {
+	for _, tools := range [][]Tool{{registry["echo"], registry["echo"]}, {{Name: "invalid"}}, {DefaultTools()["search_memory"]}} {
 		if err := env.SetAgentTools(ctx, "assistant", tools); !errors.Is(err, ErrInvalidTool) {
 			t.Fatalf("invalid tools accepted: %v", err)
 		}
@@ -528,7 +595,7 @@ func TestEnvironmentRoundTrip(t *testing.T) {
 	if string(gotMemories) != string(wantMemories) {
 		t.Fatal("shared memories not restored")
 	}
-	if len(restored.Tools) != len(MemoryTools(ctx, loaded.MemoryStore))+len(loaded.messagingTools(restored.Name))+1 {
+	if len(restored.Tools) != 7 {
 		t.Fatal("tool set not restored")
 	}
 	for _, tool := range restored.Tools {

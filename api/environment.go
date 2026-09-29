@@ -14,8 +14,6 @@ import (
 
 var validStateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
-type ToolRegistry map[string]Tool
-
 type AgentEnvironment struct {
 	mu           sync.Mutex
 	workerCtx    context.Context
@@ -111,21 +109,13 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 			return nil, fmt.Errorf("invalid or duplicate agent %q", saved.Name)
 		}
 		seen[saved.Name] = true
-		tools := make([]Tool, 0, len(saved.ToolNames))
-		for _, toolName := range saved.ToolNames {
-			tool, ok := registry[toolName]
-			if !ok || tool.Name != toolName || (tool.Execute == nil && tool.bindEnvironment == nil) {
-				return nil, fmt.Errorf("agent %q requires registered tool %q", saved.Name, toolName)
-			}
-			tools = append(tools, tool)
+		tools, err := registry.Resolve(saved.ToolNames)
+		if err != nil {
+			return nil, fmt.Errorf("agent %q requires registered tools: %w", saved.Name, err)
 		}
-		assignableTools := make([]Tool, 0, len(saved.AssignableToolNames))
-		for _, toolName := range saved.AssignableToolNames {
-			tool, ok := registry[toolName]
-			if !ok || tool.Name != toolName {
-				return nil, fmt.Errorf("agent %q requires registered assignable tool %q", saved.Name, toolName)
-			}
-			assignableTools = append(assignableTools, tool)
+		assignableTools, err := registry.Resolve(saved.AssignableToolNames)
+		if err != nil {
+			return nil, fmt.Errorf("agent %q requires registered assignable tools: %w", saved.Name, err)
 		}
 		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID, saved.AllowedModels, assignableTools...)
 		if err != nil {

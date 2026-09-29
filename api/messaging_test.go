@@ -58,9 +58,8 @@ func TestReplyRoutingInstructions(t *testing.T) {
 	if !setSessionInstructions(&session, custom) {
 		t.Fatal("existing session instructions were not refreshed")
 	}
-	env := &AgentEnvironment{}
 	var description string
-	for _, tool := range env.messagingTools("sender") {
+	for _, tool := range messagingTools() {
 		if tool.Name == "message" {
 			description = tool.Description
 		}
@@ -303,7 +302,7 @@ func TestAgentStatusAndFailureNotifications(t *testing.T) {
 	if len(notifications.Messages) != 2 {
 		t.Fatal("restart duplicated failure notifications")
 	}
-	for _, tool := range loaded.messagingTools("requester") {
+	for _, tool := range loaded.agentLocked("requester").Tools {
 		switch tool.Name {
 		case "agent_status":
 			result, err := tool.Execute(ctx, json.RawMessage(`{"name":"worker"}`))

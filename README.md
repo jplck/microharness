@@ -99,8 +99,8 @@ CLI messages also support `--sender`, `--conversation`, and `--reply-to`.
 ## Autonomous agent creation
 
 Enable the optional `create_agent` tool in an agent's create/edit tool checklist.
-It is available in the runtime catalogue but is not assigned automatically and
-is separate from `BuiltinTools()`. It uses the shared agent-creation path in
+It is available in `DefaultTools()` but is not assigned automatically.
+It uses the shared agent-creation path in
 the caller's environment, including validation, persistence, and worker startup.
 
 The tool accepts `name`, `model` (a configured model name), optional
@@ -136,8 +136,9 @@ tool to agents trusted to create persistent workers; there is no agent-count
 or spending limit enforced by this tool.
 
 For Go callers, assign `api.CreateAgentTool()` through `env.CreateAgentWithModels` or
-`env.SetAgentTools`, and register it as `registry["create_agent"]` when loading
-saved environments. The environment binds the tool when it is assigned.
+`env.SetAgentTools`, and use `api.DefaultTools()` as the registry when loading
+saved environments. Add custom tool definitions to that registry as needed.
+The environment binds each tool to its caller when it is assigned.
 `CreateAgent` and `UpdateAgent` accept optional trailing assignable `Tool` values,
 independent of the usable `[]Tool` argument. `CreateAgentWithModels` and
 `UpdateAgentWithModels` additionally accept an explicit `[]string` child-model
@@ -145,6 +146,31 @@ allowlist before the variadic assignable tools. The older methods supply an empt
 allowlist. Full updates replace all permissions; `SetAgentTools` changes only Use
 and preserves Assign and child-model permissions.
 All assignable tools must also be in the registry used to restore the environment.
+
+## Tool architecture
+
+- `api/tool.go` defines tool schemas, JSON argument handling, and `ToolContext`:
+  the environment, runtime-bound caller, assignable tools, and child-model limits.
+- `api/tool_catalog.go` owns `DefaultTools()`, automatic/optional classification,
+  optional-tool discovery, name resolution, and caller binding. `Optional()` feeds
+  the UI catalogue, `Resolve()` validates selectable names, and `Bind()` adds the
+  automatic tools and binds explicitly selected tools without mutating shared
+  definitions. Automatic tools cannot be selected as optional Use or Assign tools.
+- `api/tools_agents.go`, `api/tools_memory.go`, and `api/tools_time.go` contain the
+  model-facing adapters. They describe and decode calls, invoke ordinary operations,
+  and encode results; they do not manage inbox workers or persistence.
+- `AgentEnvironment.CreateChildAgent` owns child-creation authorization and performs
+  permission checks and creation under one lock. `SendAgentMessage`, `AgentNames`,
+  `Status`, and the memory store operations are usable without model tool calls.
+  Caller identity comes from the bound context, never model-provided arguments.
+- The agent loop offers only its bound Use tools, checks requested names against
+  that set, executes calls, and records results. Current child model/tool grants
+  are rechecked by the environment operation, so stale bindings cannot bypass
+  revocation. Schema permissions are snapshots refreshed when tools are rebound.
+
+Tool names and permission fields in saved environments are unchanged. The old
+`BuiltinTools()` and `MemoryTools()` factories are replaced by the shared catalogue;
+there is no separate registration step for `create_agent`.
 
 ## Delivery and recovery
 

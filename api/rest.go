@@ -18,24 +18,14 @@ import (
 
 func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	var mu sync.Mutex
-	registry := BuiltinTools()
-	registry["create_agent"] = CreateAgentTool()
+	registry := DefaultTools()
 	environments, err := loadAgentEnvironments(ctx, dataRoot, registry)
 	if err != nil {
 		return err
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /tools", func(w http.ResponseWriter, r *http.Request) {
-		names := make([]string, 0, len(registry))
-		for name := range registry {
-			names = append(names, name)
-		}
-		slices.Sort(names)
-		tools := make([]ToolSummary, 0, len(names))
-		for _, name := range names {
-			tools = append(tools, ToolSummary{Name: name, Description: registry[name].Description})
-		}
-		writeJSONResponse(w, http.StatusOK, tools)
+		writeJSONResponse(w, http.StatusOK, registry.Optional())
 	})
 	handleEnvironment := func(pattern string, handler func(http.ResponseWriter, *http.Request, *AgentEnvironment)) {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
@@ -131,12 +121,12 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	for _, method := range []string{http.MethodPost, http.MethodPut} {
 		handleEnvironment(method+" /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 			name := r.PathValue("name")
-			tools, err := resolveTools(registry, r.URL.Query()["tool"])
+			tools, err := registry.Resolve(r.URL.Query()["tool"])
 			if err != nil {
 				writeMessagingError(w, err)
 				return
 			}
-			assignableTools, err := resolveTools(registry, r.URL.Query()["assignable_tool"])
+			assignableTools, err := registry.Resolve(r.URL.Query()["assignable_tool"])
 			if err != nil {
 				writeMessagingError(w, err)
 				return
@@ -169,7 +159,7 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			http.Error(w, "expected one JSON array", http.StatusBadRequest)
 			return
 		}
-		tools, err := resolveTools(registry, names)
+		tools, err := registry.Resolve(names)
 		if err == nil {
 			err = env.SetAgentTools(r.Context(), r.PathValue("name"), tools)
 		}
@@ -277,18 +267,6 @@ type AgentSummary struct {
 	Pending          int      `json:"pending"`
 	Error            string   `json:"error,omitempty"`
 	Tools            []string `json:"tools"`
-}
-
-func resolveTools(registry ToolRegistry, names []string) ([]Tool, error) {
-	tools := make([]Tool, 0, len(names))
-	for _, name := range names {
-		tool, ok := registry[name]
-		if !ok {
-			return nil, fmt.Errorf("%w %q", ErrInvalidTool, name)
-		}
-		tools = append(tools, tool)
-	}
-	return tools, nil
 }
 
 func writeJSONResponse(w http.ResponseWriter, status int, value any) {

@@ -70,7 +70,7 @@ func startTestRuntime(t *testing.T, root string) (*http.Client, func()) {
 
 func TestRuntimeRestoresEnvironments(t *testing.T) {
 	ctx, root, _ := setupPersistenceTest(t)
-	registry := BuiltinTools()
+	registry := DefaultTools()
 	cli, err := NewAgentEnvironment(ctx, root, "cli-environment")
 	if err != nil {
 		t.Fatal(err)
@@ -261,8 +261,7 @@ func TestRuntimeToolSelection(t *testing.T) {
 	}
 	request("PUT", "/environments/tools/agents/assistant/tools", `["get_time","create_agent"]`, 204)
 	stop()
-	registry := BuiltinTools()
-	registry["create_agent"] = CreateAgentTool()
+	registry := DefaultTools()
 	loaded, err := LoadAgentEnvironment(ctx, root, "tools", registry)
 	if err != nil {
 		t.Fatal(err)
