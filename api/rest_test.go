@@ -114,6 +114,9 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer response.Body.Close()
+	if response.Header.Get("Content-Type") != "application/json" {
+		t.Fatal("environment list is not a JSON response")
+	}
 	var names []string
 	if err := json.NewDecoder(response.Body).Decode(&names); err != nil {
 		t.Fatal(err)
@@ -178,6 +181,9 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 		if response.StatusCode != status {
 			t.Fatalf("%s %s returned %s: %s", method, path, response.Status, data)
 		}
+		if status < 300 && len(data) > 0 && response.Header.Get("Content-Type") != "application/json" {
+			t.Fatalf("%s %s is not a JSON response", method, path)
+		}
 		return data
 	}
 	request(http.MethodPost, "/environments/mail", "", http.StatusCreated)
@@ -192,6 +198,9 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 		request(http.MethodPost, "/environments/mail/messages", body, http.StatusBadRequest)
 	}
 	request(http.MethodPost, "/environments/missing/messages", `{}`, http.StatusNotFound)
+	request(http.MethodPost, "/environments/missing/agents/recipient?model=test-model", "", http.StatusNotFound)
+	request(http.MethodGet, "/environments/missing/agents/recipient/inbox", "", http.StatusNotFound)
+	request(http.MethodPost, "/environments/missing/agents/recipient/inbox/retry", "", http.StatusNotFound)
 	request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","To":"missing","Content":"hello"}`, http.StatusNotFound)
 	request(http.MethodGet, "/environments/mail/agents/missing/inbox", "", http.StatusNotFound)
 	request(http.MethodPost, "/environments/mail/agents/missing/inbox/retry", "", http.StatusNotFound)

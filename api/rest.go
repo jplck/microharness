@@ -23,20 +23,19 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		return err
 	}
 	mux := http.NewServeMux()
-	lookupEnvironment := func(w http.ResponseWriter, r *http.Request) *AgentEnvironment {
-		mu.Lock()
-		env := environments[r.PathValue("id")]
-		mu.Unlock()
-		if env == nil {
-			http.Error(w, "environment not found", http.StatusNotFound)
-		}
-		return env
+	handleEnvironment := func(pattern string, handler func(http.ResponseWriter, *http.Request, *AgentEnvironment)) {
+		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			env := environments[r.PathValue("id")]
+			mu.Unlock()
+			if env == nil {
+				http.Error(w, "environment not found", http.StatusNotFound)
+				return
+			}
+			handler(w, r, env)
+		})
 	}
-	mux.HandleFunc("POST /environments/{id}/messages", func(w http.ResponseWriter, r *http.Request) {
-		env := lookupEnvironment(w, r)
-		if env == nil {
-			return
-		}
+	handleEnvironment("POST /environments/{id}/messages", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 		decoder.DisallowUnknownFields()
 		var envelope Envelope
@@ -57,43 +56,24 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			writeMessagingError(w, err)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusAccepted)
-		if err := json.NewEncoder(w).Encode(map[string]string{"id": id, "status": "accepted"}); err != nil {
-			log.Printf("message acknowledgement failed: %v", err)
-		}
+		writeJSONResponse(w, http.StatusAccepted, map[string]string{"id": id, "status": "accepted"})
 	})
-	mux.HandleFunc("GET /environments/{id}/agents/{name}/inbox", func(w http.ResponseWriter, r *http.Request) {
-		env := lookupEnvironment(w, r)
-		if env == nil {
-			return
-		}
+	handleEnvironment("GET /environments/{id}/agents/{name}/inbox", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		inbox, err := env.Inbox(r.PathValue("name"))
 		if err != nil {
 			writeMessagingError(w, err)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(inbox); err != nil {
-			log.Printf("inbox response failed: %v", err)
-		}
+		writeJSONResponse(w, http.StatusOK, inbox)
 	})
-	mux.HandleFunc("POST /environments/{id}/agents/{name}/inbox/retry", func(w http.ResponseWriter, r *http.Request) {
-		env := lookupEnvironment(w, r)
-		if env == nil {
-			return
-		}
+	handleEnvironment("POST /environments/{id}/agents/{name}/inbox/retry", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		if err := env.RetryInbox(r.Context(), r.PathValue("name")); err != nil {
 			writeMessagingError(w, err)
 			return
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
-	mux.HandleFunc("POST /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request) {
-		env := lookupEnvironment(w, r)
-		if env == nil {
-			return
-		}
+	handleEnvironment("POST /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		name := r.PathValue("name")
 		if _, err := env.CreateAgent(ctx, r.URL.Query().Get("model"), nil, name, r.URL.Query().Get("instructions"), false); err != nil {
 			writeMessagingError(w, err)
@@ -140,10 +120,7 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		}
 		mu.Unlock()
 		slices.Sort(names)
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(names); err != nil {
-			log.Printf("environment list response failed: %v", err)
-		}
+		writeJSONResponse(w, http.StatusOK, names)
 	})
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
@@ -190,6 +167,14 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		return nil
 	}
 	return err
+}
+
+func writeJSONResponse(w http.ResponseWriter, status int, value any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		log.Printf("JSON response failed: %v", err)
+	}
 }
 
 func writeMessagingError(w http.ResponseWriter, err error) {
