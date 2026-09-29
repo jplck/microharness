@@ -297,9 +297,14 @@ func (env *AgentEnvironment) messagingTools(sender string) []Tool {
 			Parameters:  []Parameter{{Name: "name", Type: String, Description: "Agent name to inspect", Required: true}},
 			Execute: JSONHandler(func(ctx context.Context, arguments struct {
 				Name string `json:"name"`
-			}) (string, error) { status, err := env.Status(arguments.Name); if err != nil {
-				return "", err
-			}; data, err := json.Marshal(status); return string(data), err }),
+			}) (string, error) {
+				status, err := env.Status(arguments.Name)
+				if err != nil {
+					return "", err
+				}
+				data, err := json.Marshal(status)
+				return string(data), err
+			}),
 		},
 		{
 			Name: "list_agents", Description: "List agent names in this environment that can receive messages.",
