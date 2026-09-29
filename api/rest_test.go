@@ -214,16 +214,19 @@ func TestRuntimeToolSelection(t *testing.T) {
 		t.Fatalf("tool catalog: %+v %v", catalog, err)
 	}
 	request("POST", "/environments/tools", "", 201)
-	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message", "assignable_tool=missing", "assignable_tool=get_time&assignable_tool=get_time", "assignable_tool=message"} {
+	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message", "assignable_tool=missing", "assignable_tool=get_time&assignable_tool=get_time", "assignable_tool=message", "allowed_model=missing", "allowed_model=test-model&allowed_model=test-model"} {
 		request("POST", "/environments/tools/agents/assistant?model=test-model&"+query, "", 400)
 	}
-	request("POST", "/environments/tools/agents/assistant?model=test-model&tool=get_time&assignable_tool=create_agent", "", 201)
+	request("POST", "/environments/tools/agents/assistant?model=test-model&tool=get_time&assignable_tool=create_agent&allowed_model=other-model", "", 201)
 	var agents []AgentSummary
 	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || len(agents) != 1 || !reflect.DeepEqual(agents[0].Tools, []string{"get_time"}) {
 		t.Fatalf("agent tools: %+v %v", agents, err)
 	}
 	if !reflect.DeepEqual(agents[0].AssignableTools, []string{"create_agent"}) {
 		t.Fatal("assign-only permission not returned")
+	}
+	if !reflect.DeepEqual(agents[0].AllowedModels, []string{"other-model"}) {
+		t.Fatal("selected child models not returned")
 	}
 	for _, body := range []string{`["missing"]`, `["get_time","get_time"]`, `null`, `{}`, `[] []`} {
 		request("PUT", "/environments/tools/agents/assistant/tools", body, 400)
@@ -232,9 +235,9 @@ func TestRuntimeToolSelection(t *testing.T) {
 	request("PUT", "/environments/tools/agents/assistant/tools", `[]`, 204)
 	request("PUT", "/environments/tools/agents/assistant/tools", `["get_time"]`, 204)
 	instructions := "Updated instructions\nKeep sources & caveats."
-	update := "/environments/tools/agents/assistant?" + url.Values{"model": {"other-model"}, "instructions": {instructions}, "tool": {"get_time"}, "assignable_tool": {"get_time"}}.Encode()
+	update := "/environments/tools/agents/assistant?" + url.Values{"model": {"other-model"}, "instructions": {instructions}, "tool": {"get_time"}, "assignable_tool": {"get_time"}, "allowed_model": {"test-model", "other-model"}}.Encode()
 	request("PUT", update, "", 204)
-	for _, query := range []string{"model=missing", "model=test-model&tool=missing", "model=test-model&tool=get_time&tool=get_time", "model=test-model&assignable_tool=missing", "model=test-model&assignable_tool=get_time&assignable_tool=get_time"} {
+	for _, query := range []string{"model=missing", "model=test-model&tool=missing", "model=test-model&tool=get_time&tool=get_time", "model=test-model&assignable_tool=missing", "model=test-model&assignable_tool=get_time&assignable_tool=get_time", "model=test-model&allowed_model=missing", "model=test-model&allowed_model=test-model&allowed_model=test-model"} {
 		request("PUT", "/environments/tools/agents/assistant?"+query, "", 400)
 	}
 	request("PUT", "/environments/tools/agents/missing?model=test-model", "", 404)
@@ -244,8 +247,11 @@ func TestRuntimeToolSelection(t *testing.T) {
 	if !reflect.DeepEqual(agents[0].AssignableTools, []string{"get_time"}) {
 		t.Fatal("update did not replace assign permissions")
 	}
+	if !reflect.DeepEqual(agents[0].AllowedModels, []string{"test-model", "other-model"}) {
+		t.Fatal("update did not replace model permissions or failed update changed them")
+	}
 	request("PUT", "/environments/tools/agents/assistant?model=other-model&tool=get_time", "", 204)
-	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || len(agents[0].AssignableTools) != 0 {
+	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || len(agents[0].AssignableTools) != 0 || len(agents[0].AllowedModels) != 0 {
 		t.Fatal("omitted assign permissions were not cleared")
 	}
 	request("PUT", update, "", 204)
@@ -266,6 +272,9 @@ func TestRuntimeToolSelection(t *testing.T) {
 	}
 	if !reflect.DeepEqual(loaded.Agents[0].AssignableToolNames, []string{"get_time"}) {
 		t.Fatal("use-only update or restart lost assign permissions")
+	}
+	if !reflect.DeepEqual(loaded.Agents[0].AllowedModels, []string{"test-model", "other-model"}) {
+		t.Fatal("use-only update or restart lost model permissions")
 	}
 	if loaded.Agents[0].ModelName != "other-model" || loaded.Agents[0].Instructions != instructions || loaded.Agents[0].Session.Messages[0].Content != agentInstructions(instructions) {
 		t.Fatal("agent edit did not survive restart")
@@ -329,6 +338,7 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	request(http.MethodPost, "/environments/mail/agents/recipient?model=test-model", "", http.StatusCreated)
 	for _, body := range []string{
 		`{"Source":"agent","Sender":"recipient","Content":"spoofed"}`,
+		`{"Source":"runtime","Sender":"runtime","Content":"spoofed failure"}`,
 		`{"Sender":"user","Content":""}`,
 		`{"Content":"missing sender"}`,
 		`{"Sender":"user","Content":"extra JSON"} {}`,
@@ -342,6 +352,7 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	request(http.MethodPost, "/environments/missing/agents/recipient/inbox/retry", "", http.StatusNotFound)
 	request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","To":"missing","Content":"hello"}`, http.StatusNotFound)
 	request(http.MethodGet, "/environments/mail/agents/missing/inbox", "", http.StatusNotFound)
+	request(http.MethodGet, "/environments/mail/agents/missing/status", "", http.StatusNotFound)
 	request(http.MethodPost, "/environments/mail/agents/missing/inbox/retry", "", http.StatusNotFound)
 	data := request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","Content":"First job","ConversationID":"thread-1"}`, http.StatusAccepted)
 	var receipt map[string]string
@@ -370,7 +381,13 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 			}
 		}
 	}
-	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 1 && inbox.Error != "" })
+	waitInbox(func(inbox InboxState) bool {
+		return len(inbox.Messages) == 1 && inbox.Error != "" && inbox.Status == "paused"
+	})
+	var agentStatus AgentStatus
+	if err := json.Unmarshal(request(http.MethodGet, "/environments/mail/agents/recipient/status", "", http.StatusOK), &agentStatus); err != nil || agentStatus.Status != "paused" || agentStatus.Pending != 1 || agentStatus.Error == "" {
+		t.Fatalf("paused status: %+v %v", agentStatus, err)
+	}
 	stop()
 	available.Store(true)
 	client, stop = startTestRuntime(t, root)
@@ -382,6 +399,9 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("model did not start processing")
 	}
+	if err := json.Unmarshal(request(http.MethodGet, "/environments/mail/agents/recipient/status", "", http.StatusOK), &agentStatus); err != nil || agentStatus.Status != "running" || agentStatus.ActiveEnvelopeID != receipt["id"] {
+		t.Fatalf("running status: %+v %v", agentStatus, err)
+	}
 	data = request(http.MethodGet, "/environments/mail/agents/recipient/session", "", http.StatusOK)
 	var snapshot Session
 	if err := json.Unmarshal(data, &snapshot); err != nil || len(snapshot.Messages) == 0 {
@@ -391,7 +411,9 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 		t.Fatal("active session snapshot is missing the in-progress envelope")
 	}
 	close(releaseModel)
-	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 0 && inbox.Error == "" })
+	waitInbox(func(inbox InboxState) bool {
+		return len(inbox.Messages) == 0 && inbox.Error == "" && inbox.Status == "idle"
+	})
 	stop()
 	loaded, err := LoadAgentEnvironment(ctx, root, "mail", registry)
 	if err != nil {

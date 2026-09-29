@@ -56,8 +56,10 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			agents = append(agents, AgentSummary{
 				Name: agent.Name, Model: agent.ModelName, Instructions: agent.Instructions,
 				Pending: len(agent.Inbox), Error: agent.InboxError,
+				Status: agentStatusLocked(agent).Status, ActiveEnvelopeID: agent.activeEnvelopeID,
 				Tools:           append([]string{}, agent.ToolNames...),
 				AssignableTools: append([]string{}, agent.AssignableToolNames...),
+				AllowedModels:   append([]string{}, agent.AllowedModels...),
 			})
 		}
 		env.mu.Unlock()
@@ -75,8 +77,8 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			http.Error(w, "expected one envelope", http.StatusBadRequest)
 			return
 		}
-		if envelope.Source == "agent" {
-			http.Error(w, "agent source is reserved for the message tool", http.StatusBadRequest)
+		if envelope.Source == "agent" || envelope.Source == "runtime" {
+			http.Error(w, "agent and runtime sources are reserved", http.StatusBadRequest)
 			return
 		}
 		id, err := env.Message(r.Context(), envelope)
@@ -85,6 +87,14 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			return
 		}
 		writeJSONResponse(w, http.StatusAccepted, map[string]string{"id": id, "status": "accepted"})
+	})
+	handleEnvironment("GET /environments/{id}/agents/{name}/status", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		status, err := env.Status(r.PathValue("name"))
+		if err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, status)
 	})
 	handleEnvironment("GET /environments/{id}/agents/{name}/inbox", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		inbox, err := env.Inbox(r.PathValue("name"))
@@ -132,9 +142,9 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 				return
 			}
 			if r.Method == http.MethodPut {
-				err = env.UpdateAgent(r.Context(), name, r.URL.Query().Get("model"), r.URL.Query().Get("instructions"), tools, assignableTools...)
+				err = env.UpdateAgentWithModels(r.Context(), name, r.URL.Query().Get("model"), r.URL.Query().Get("instructions"), tools, r.URL.Query()["allowed_model"], assignableTools...)
 			} else {
-				_, err = env.CreateAgent(ctx, r.URL.Query().Get("model"), tools, name, r.URL.Query().Get("instructions"), false, assignableTools...)
+				_, err = env.CreateAgentWithModels(ctx, r.URL.Query().Get("model"), tools, name, r.URL.Query().Get("instructions"), false, r.URL.Query()["allowed_model"], assignableTools...)
 			}
 			if err != nil {
 				writeMessagingError(w, err)
@@ -257,13 +267,16 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 }
 
 type AgentSummary struct {
-	AssignableTools []string `json:"assignable_tools"`
-	Name            string   `json:"name"`
-	Model           string   `json:"model"`
-	Instructions    string   `json:"instructions"`
-	Pending         int      `json:"pending"`
-	Error           string   `json:"error,omitempty"`
-	Tools           []string `json:"tools"`
+	Status           string   `json:"status"`
+	ActiveEnvelopeID string   `json:"active_envelope_id,omitempty"`
+	AllowedModels    []string `json:"allowed_models"`
+	AssignableTools  []string `json:"assignable_tools"`
+	Name             string   `json:"name"`
+	Model            string   `json:"model"`
+	Instructions     string   `json:"instructions"`
+	Pending          int      `json:"pending"`
+	Error            string   `json:"error,omitempty"`
+	Tools            []string `json:"tools"`
 }
 
 func resolveTools(registry ToolRegistry, names []string) ([]Tool, error) {
@@ -292,7 +305,7 @@ func writeMessagingError(w http.ResponseWriter, err error) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 	case errors.Is(err, ErrAgentExists), errors.Is(err, ErrAgentBusy):
 		http.Error(w, err.Error(), http.StatusConflict)
-	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound), errors.Is(err, ErrInvalidTool):
+	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound), errors.Is(err, ErrModelNotAllowed), errors.Is(err, ErrInvalidTool):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, ErrEnvironmentClosed), errors.Is(err, context.Canceled):
 		http.Error(w, "environment is stopping", http.StatusServiceUnavailable)

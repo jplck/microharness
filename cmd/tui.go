@@ -66,6 +66,9 @@ type tuiModel struct {
 	assignableTools   map[string]bool
 	assignPermission  bool
 	toolCursor        int
+	allowedModels     map[string]bool
+	childModelChoices []string
+	childModelCursor  int
 	sessionGeneration uint64
 	sessionLoading    bool
 }
@@ -224,6 +227,11 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			var content strings.Builder
 			if inbox.Error != "" {
 				fmt.Fprintf(&content, "PAUSED\n%s\n\n", inbox.Error)
+			} else if inbox.Status != "" {
+				fmt.Fprintf(&content, "%s\n\n", strings.ToUpper(inbox.Status))
+			}
+			if inbox.ActiveEnvelopeID != "" {
+				fmt.Fprintf(&content, "Active envelope: %s\n\n", inbox.ActiveEnvelopeID)
 			}
 			if len(inbox.Messages) == 0 {
 				content.WriteString("No pending messages.")
@@ -367,6 +375,8 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 	model.selectedTools = make(map[string]bool)
 	model.assignableTools = make(map[string]bool)
 	model.assignPermission = false
+	model.allowedModels = make(map[string]bool)
+	model.childModelChoices, model.childModelCursor = nil, 0
 	model.status, model.failed = "", false
 	model.labels = []string{"Name"}
 	if kind == "agent" {
@@ -381,6 +391,9 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 			return nil
 		}
 		model.labels = []string{"Name", "Model"}
+		for _, config := range model.models {
+			model.childModelChoices = append(model.childModelChoices, config.Name)
+		}
 	}
 	if kind == "message" {
 		model.labels = []string{"Sender", "Conversation ID", "Reply to"}
@@ -421,6 +434,12 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 			for _, name := range existing.AssignableTools {
 				model.assignableTools[name] = true
 			}
+			for _, name := range existing.AllowedModels {
+				model.allowedModels[name] = true
+				if !slices.Contains(model.childModelChoices, name) {
+					model.childModelChoices = append(model.childModelChoices, name)
+				}
+			}
 		}
 		return model.loadTools()
 	}
@@ -435,6 +454,14 @@ func (model *tuiModel) loadTools() tea.Cmd {
 
 func (model tuiModel) toolPickerFocused() bool {
 	return model.form == "agent" && model.focus == len(model.inputs)+1
+}
+
+func (model tuiModel) childModelsVisible() bool {
+	return model.form == "agent" && (model.selectedTools["create_agent"] || model.assignableTools["create_agent"])
+}
+
+func (model tuiModel) childModelPickerFocused() bool {
+	return model.childModelsVisible() && model.focus == len(model.inputs)+2
 }
 
 func selectedToolNames(selection map[string]bool) []string {
@@ -467,6 +494,9 @@ func (model *tuiModel) updateForm(message tea.Msg) (tea.Model, tea.Cmd) {
 			if model.form == "agent" {
 				count++
 			}
+			if model.childModelsVisible() {
+				count++
+			}
 			model.text.Blur()
 			for index := range model.inputs {
 				model.inputs[index].Blur()
@@ -479,10 +509,24 @@ func (model *tuiModel) updateForm(message tea.Msg) (tea.Model, tea.Cmd) {
 			if model.focus == len(model.inputs) {
 				return model, model.text.Focus()
 			}
-			if model.toolPickerFocused() {
+			if model.toolPickerFocused() || model.childModelPickerFocused() {
 				return model, nil
 			}
 			return model, model.inputs[model.focus].Focus()
+		}
+		if model.childModelPickerFocused() {
+			switch key.String() {
+			case "up", "k":
+				model.childModelCursor = max(0, model.childModelCursor-1)
+			case "down", "j":
+				model.childModelCursor = min(max(0, len(model.childModelChoices)-1), model.childModelCursor+1)
+			case " ":
+				if len(model.childModelChoices) > 0 {
+					name := model.childModelChoices[model.childModelCursor]
+					model.allowedModels[name] = !model.allowedModels[name]
+				}
+			}
+			return model, nil
 		}
 		if model.toolPickerFocused() {
 			switch key.String() {
@@ -517,7 +561,7 @@ func (model *tuiModel) updateForm(message tea.Msg) (tea.Model, tea.Cmd) {
 			return model, nil
 		}
 	}
-	if model.toolPickerFocused() || model.form == "agent" && model.editingAgent != "" && model.focus == 0 {
+	if model.toolPickerFocused() || model.childModelPickerFocused() || model.form == "agent" && model.editingAgent != "" && model.focus == 0 {
 		return model, nil
 	}
 	var command tea.Cmd
@@ -549,6 +593,11 @@ func (model *tuiModel) submit() tea.Cmd {
 		}
 		for _, name := range selectedToolNames(model.assignableTools) {
 			query.Add("assignable_tool", name)
+		}
+		if model.childModelsVisible() {
+			for _, name := range selectedToolNames(model.allowedModels) {
+				query.Add("allowed_model", name)
+			}
 		}
 		path = agentPath(model.environment, first) + "?" + query.Encode()
 	case "message":
@@ -596,6 +645,9 @@ func (model tuiModel) renderSession() string {
 					if envelope.Source == "agent" {
 						label = "AGENT"
 						color = lipgloss.Color("141")
+					} else if envelope.Source == "runtime" {
+						label = "RUNTIME"
+						color = lipgloss.Color("203")
 					}
 					label += " / " + envelope.Sender
 					body = envelope.Content
@@ -661,8 +713,12 @@ func (model *tuiModel) renderContent() {
 			} else {
 				agent := model.agents[index]
 				line = fmt.Sprintf("%s  |  %s  |  %d pending", agent.Name, agent.Model, agent.Pending)
+				state := agent.Status
 				if agent.Error != "" {
-					line += "  PAUSED"
+					state = "paused"
+				}
+				if state != "" {
+					line = fmt.Sprintf("%s  |  %s  |  %d pending  |  %s", agent.Name, strings.ToUpper(state), agent.Pending, agent.Model)
 				}
 			}
 			line = lipgloss.NewStyle().MaxWidth(max(1, model.view.Width-2)).MaxHeight(1).Render(terminalText(line))
@@ -691,6 +747,10 @@ func (model *tuiModel) renderContent() {
 
 func (model tuiModel) renderToolPicker() string {
 	rows := 2
+	compact := model.childModelsVisible() && model.height < 26
+	if compact {
+		rows = 1
+	}
 	start := max(0, model.toolCursor-rows+1)
 	var choices []string
 	for index := start; index < min(len(model.toolChoices), start+rows); index++ {
@@ -724,9 +784,37 @@ func (model tuiModel) renderToolPicker() string {
 	if len(model.toolChoices) > 0 {
 		description = terminalText(model.toolChoices[model.toolCursor].Description)
 	}
+	if compact {
+		return "  Use Assign Tool\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\nMemory + messaging: always enabled"
+	}
 	return "  Use Assign Tool\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\n" +
 		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).MaxWidth(model.width-4).MaxHeight(1).Render(description) + "\n" +
 		"Memory + messaging: always enabled"
+}
+
+func (model tuiModel) renderChildModelPicker() string {
+	rows := 1
+	if model.height >= 26 {
+		rows = 2
+	}
+	start := max(0, model.childModelCursor-rows+1)
+	choices := []string{}
+	for index := start; index < min(len(model.childModelChoices), start+rows); index++ {
+		name := model.childModelChoices[index]
+		mark, pointer := "[ ]", "  "
+		if model.allowedModels[name] {
+			mark = "[x]"
+		}
+		if model.childModelPickerFocused() && index == model.childModelCursor {
+			pointer = "> "
+		}
+		line := pointer + mark + " " + terminalText(name)
+		choices = append(choices, lipgloss.NewStyle().MaxWidth(model.width-4).MaxHeight(1).Render(line))
+	}
+	if len(choices) == 0 {
+		choices = append(choices, "No models configured.")
+	}
+	return fmt.Sprintf("Child models (%d selected)\n", len(selectedToolNames(model.allowedModels))) + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n"))
 }
 
 func (model tuiModel) View() string {
@@ -777,10 +865,13 @@ func (model tuiModel) View() string {
 		}
 		if model.form == "agent" {
 			form.WriteString("\n" + model.renderToolPicker())
+			if model.childModelsVisible() {
+				form.WriteString("\n" + model.renderChildModelPicker())
+			}
 		}
 		body = form.String()
 		help = "tab/shift+tab field | ctrl+s submit | esc cancel | ctrl+c quit"
-		if model.toolPickerFocused() {
+		if model.toolPickerFocused() || model.childModelPickerFocused() {
 			help = "arrows select | space toggle | tab next | ctrl+s save | esc cancel"
 		}
 	}

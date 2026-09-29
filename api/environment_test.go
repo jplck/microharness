@@ -34,7 +34,7 @@ func TestCreateAgentTool(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent, err := env.CreateAgent(ctx, "test-model", []Tool{registry["create_agent"]}, "parent", "Delegate tasks", true)
+	parent, err := env.CreateAgentWithModels(ctx, "test-model", []Tool{registry["create_agent"]}, "parent", "Delegate tasks", true, []string{"test-model"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +61,7 @@ func TestCreateAgentTool(t *testing.T) {
 		t.Fatal("creation changed initial agent or failed to add child")
 	}
 	child := env.Agents[1]
-	if child.Instructions != "Research and reply to the sender" || len(child.ToolNames) != 0 || len(child.Tools) != 5 {
+	if child.Instructions != "Research and reply to the sender" || len(child.ToolNames) != 0 || len(child.Tools) != 6 {
 		t.Fatal("child did not get requested instructions and only automatic tools")
 	}
 	for _, test := range []struct {
@@ -70,10 +70,12 @@ func TestCreateAgentTool(t *testing.T) {
 	}{
 		{`{"name":"researcher","model":"test-model"}`, ErrAgentExists},
 		{`{"name":"../invalid","model":"test-model"}`, ErrInvalidName},
-		{`{"name":"invalid-model","model":"missing"}`, ErrModelNotFound},
+		{`{"name":"invalid-model","model":"missing"}`, ErrModelNotAllowed},
 	} {
 		if _, err := create.Execute(ctx, json.RawMessage(test.arguments)); !errors.Is(err, test.want) {
 			t.Fatalf("%s: %v", test.arguments, err)
+		} else if errors.Is(err, ErrModelNotAllowed) && !strings.Contains(err.Error(), `"test-model"`) {
+			t.Fatalf("missing configured model choices: %v", err)
 		}
 	}
 	if _, err := create.Execute(ctx, json.RawMessage(`{`)); err == nil {
@@ -100,6 +102,27 @@ func TestCreateAgentTool(t *testing.T) {
 	if _, ok := BuiltinTools()["create_agent"]; ok {
 		t.Fatal("creation tool registered as a default builtin")
 	}
+	models, err := ListModels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	models = append(models, Model{Name: "new-model", Provider: ProviderOpenAI, Endpoint: "http://localhost"})
+	if err := writeJSONAtomic("models.json", map[string]any{"models": models}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"unknown-model-child","model":"new-model"}`)); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("newly configured model was automatically allowed: %v", err)
+	}
+	if err := env.SetAgentTools(ctx, parent.Name, []Tool{registry["create_agent"]}); err != nil {
+		t.Fatal(err)
+	}
+	refreshed := findCreate(parent)
+	if !reflect.DeepEqual(refreshed.Parameters[1].Enum, []string{"test-model"}) {
+		t.Fatalf("rebinding lost model restrictions: %v", refreshed.Parameters[1].Enum)
+	}
+	if !reflect.DeepEqual(create.Parameters[1].Enum, []string{"test-model"}) {
+		t.Fatal("rebinding mutated an existing tool definition")
+	}
 }
 
 func TestCreateAgentToolAssignments(t *testing.T) {
@@ -111,7 +134,7 @@ func TestCreateAgentToolAssignments(t *testing.T) {
 	}
 	usable := []Tool{registry["create_agent"], registry["echo"]}
 	assignable := []Tool{registry["get_time"], registry["create_agent"]}
-	parent, err := env.CreateAgent(ctx, "test-model", usable, "parent", "", true, assignable...)
+	parent, err := env.CreateAgentWithModels(ctx, "test-model", usable, "parent", "", true, []string{"test-model"}, assignable...)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,6 +166,7 @@ func TestCreateAgentToolAssignments(t *testing.T) {
 			Parameters struct {
 				Properties map[string]struct {
 					Type  string
+					Enum  []string
 					Items struct{ Type string }
 				}
 			}
@@ -153,6 +177,12 @@ func TestCreateAgentToolAssignments(t *testing.T) {
 	}
 	if property := definition.Function.Parameters.Properties["tools"]; property.Type != "array" || property.Items.Type != "string" {
 		t.Fatalf("invalid tools schema: %s", schema)
+	}
+	if property := definition.Function.Parameters.Properties["model"]; property.Type != "string" || !reflect.DeepEqual(property.Enum, []string{"test-model"}) {
+		t.Fatalf("model choices do not match configured models: %s", schema)
+	}
+	if len(registry["create_agent"].Parameters[1].Enum) != 0 {
+		t.Fatal("binding mutated the shared tool definition")
 	}
 	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"child","model":"test-model","tools":["get_time","create_agent"]}`)); err != nil {
 		t.Fatal(err)
@@ -206,10 +236,10 @@ func TestCreateAgentToolAssignments(t *testing.T) {
 	}
 	err = env.UpdateAgent(ctx, "parent", "test-model", "", usable)
 	env.DataRoot = previousRoot
-	if err == nil || !reflect.DeepEqual(parent.AssignableToolNames, []string{"get_time", "create_agent"}) {
+	if err == nil || !reflect.DeepEqual(parent.AssignableToolNames, []string{"get_time", "create_agent"}) || !reflect.DeepEqual(parent.AllowedModels, []string{"test-model"}) {
 		t.Fatal("failed update lost permissions")
 	}
-	if err := env.UpdateAgent(ctx, "parent", "test-model", "", usable); err != nil {
+	if err := env.UpdateAgentWithModels(ctx, "parent", "test-model", "", usable, []string{"test-model"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"revoked","model":"test-model","tools":["get_time"]}`)); !errors.Is(err, ErrInvalidTool) {
@@ -223,6 +253,87 @@ func TestCreateAgentToolAssignments(t *testing.T) {
 	}
 	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"revoked","model":"test-model"}`)); !errors.Is(err, ErrInvalidTool) {
 		t.Fatalf("revoked creation still allowed: %v", err)
+	}
+}
+
+func TestCreateAgentModelPermissions(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	registry["create_agent"] = CreateAgentTool()
+	models, err := ListModels()
+	if err != nil {
+		t.Fatal(err)
+	}
+	models = append(models, Model{Name: "child-model", Provider: ProviderOpenAI, Endpoint: "http://localhost"})
+	if err := writeJSONAtomic("models.json", map[string]any{"models": models}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := NewAgentEnvironment(ctx, root, "models")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []Tool{registry["create_agent"]}
+	parent, err := env.CreateAgent(ctx, "test-model", tools, "parent", "", true, tools...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	creation := func(agent *Agent) Tool {
+		for _, tool := range agent.Tools {
+			if tool.Name == "create_agent" {
+				return tool
+			}
+		}
+		t.Fatal("missing create_agent")
+		return Tool{}
+	}
+	if _, err := creation(parent).Execute(ctx, json.RawMessage(`{"name":"denied","model":"test-model"}`)); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("empty list allowed creation: %v", err)
+	}
+	for _, names := range [][]string{{"missing"}, {"child-model", "child-model"}} {
+		if err := env.UpdateAgentWithModels(ctx, "parent", "test-model", "", tools, names, tools...); err == nil {
+			t.Fatal("invalid model list accepted")
+		}
+	}
+	if err := env.UpdateAgentWithModels(ctx, "parent", "test-model", "", tools, []string{"child-model"}, tools...); err != nil {
+		t.Fatal(err)
+	}
+	create := creation(parent)
+	if !reflect.DeepEqual(create.Parameters[1].Enum, []string{"child-model"}) {
+		t.Fatal("schema exposed models outside allowlist")
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"denied","model":"test-model"}`)); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("parent model implicitly permitted: %v", err)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"child","model":"child-model","tools":["create_agent"]}`)); err != nil {
+		t.Fatal(err)
+	}
+	child := env.agentLocked("child")
+	if !reflect.DeepEqual(child.AllowedModels, parent.AllowedModels) || len(child.AssignableTools) != 0 {
+		t.Fatal("child permissions not inherited correctly")
+	}
+	if _, err := creation(child).Execute(ctx, json.RawMessage(`{"name":"denied","model":"test-model","caller":"parent"}`)); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("child exceeded inherited limits: %v", err)
+	}
+	if _, err := creation(child).Execute(ctx, json.RawMessage(`{"name":"grandchild","model":"child-model"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(env.agentLocked("grandchild").AllowedModels) != 0 {
+		t.Fatal("child without create_agent received model permissions")
+	}
+	loaded, err := LoadAgentEnvironment(ctx, root, "models", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.agentLocked("child").AllowedModels, []string{"child-model"}) || !reflect.DeepEqual(creation(loaded.InitialAgent).Parameters[1].Enum, []string{"child-model"}) {
+		t.Fatal("permissions lost on reload")
+	}
+	if err := env.UpdateAgent(ctx, "parent", "test-model", "", tools, tools...); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"revoked","model":"child-model"}`)); !errors.Is(err, ErrModelNotAllowed) {
+		t.Fatalf("stale closure retained model permissions: %v", err)
+	}
+	if !reflect.DeepEqual(child.AllowedModels, []string{"child-model"}) {
+		t.Fatal("parent revocation changed independent child permissions")
 	}
 }
 
@@ -276,7 +387,7 @@ func TestSetAgentTools(t *testing.T) {
 	if err := env.SetAgentTools(ctx, "assistant", nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(agent.ToolNames) != 0 || len(agent.Tools) != 5 {
+	if len(agent.ToolNames) != 0 || len(agent.Tools) != 6 {
 		t.Fatal("clearing optional tools removed automatic tools")
 	}
 	if err := env.SetAgentTools(ctx, "missing", nil); !errors.Is(err, ErrAgentNotFound) {

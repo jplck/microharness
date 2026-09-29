@@ -245,6 +245,130 @@ func TestTUIEditAgent(t *testing.T) {
 	}
 }
 
+func TestTUIChildModelSelection(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("models.json", []byte(`{"models":[{"name":"first","provider":"openai"},{"name":"second","provider":"openai"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, permission := range []string{"use", "assign"} {
+		t.Run(permission, func(t *testing.T) {
+			reject, saves := true, 0
+			var saved api.AgentSummary
+			client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == "GET" && r.URL.Path == "/tools":
+					io.WriteString(w, `[{"name":"create_agent","description":"Create agents"}]`)
+				case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/agents"):
+					json.NewEncoder(w).Encode([]api.AgentSummary{saved})
+				case r.Method == "POST" || r.Method == "PUT":
+					saves++
+					if reject {
+						http.Error(w, "busy", http.StatusConflict)
+						return
+					}
+					saved = api.AgentSummary{Name: "worker", Model: r.URL.Query().Get("model"), Tools: r.URL.Query()["tool"], AssignableTools: r.URL.Query()["assignable_tool"], AllowedModels: r.URL.Query()["allowed_model"]}
+					if r.Method == "POST" {
+						w.WriteHeader(http.StatusCreated)
+					} else {
+						w.WriteHeader(http.StatusNoContent)
+					}
+				default:
+					t.Fatalf("unexpected request: %s %s", r.Method, r.URL)
+				}
+			})
+			model := newTUI(t.Context(), client)
+			model.page, model.environment, model.busy = "agents", "team", false
+			_, load := model.Update(tuiKey("n"))
+			model.Update(load())
+			model.inputs[0].SetValue("worker")
+			if model.childModelsVisible() || strings.Contains(model.View(), "Child models") {
+				t.Fatal("selector shown without create_agent")
+			}
+			for range 3 {
+				model.Update(tea.KeyMsg{Type: tea.KeyTab})
+			}
+			if permission == "assign" {
+				model.Update(tea.KeyMsg{Type: tea.KeyRight})
+			}
+			model.Update(tuiKey(" "))
+			if !model.childModelsVisible() || len(selectedToolNames(model.allowedModels)) != 0 {
+				t.Fatal("selector missing or models automatically granted")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyTab})
+			if !model.childModelPickerFocused() {
+				t.Fatal("tab did not focus child models")
+			}
+			model.Update(tuiKey(" "))
+			model.Update(tea.KeyMsg{Type: tea.KeyDown})
+			model.Update(tuiKey(" "))
+			for _, size := range [][2]int{{40, 22}, {80, 24}, {120, 40}} {
+				model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+				view := ansi.Strip(model.View())
+				if !strings.Contains(view, "Child models (2 selected)") || !strings.Contains(view, "> [x] second") || !strings.Contains(view, "always enabled") {
+					t.Fatalf("selector clipped at %v:\n%s", size, view)
+				}
+				for _, line := range strings.Split(view, "\n") {
+					if ansi.StringWidth(line) > size[0] {
+						t.Fatal("selector exceeds width")
+					}
+				}
+				if len(strings.Split(view, "\n")) > size[1] {
+					t.Fatal("selector exceeds height")
+				}
+			}
+			_, save := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+			model.Update(save())
+			if !model.failed || !model.allowedModels["first"] || !model.allowedModels["second"] {
+				t.Fatal("failure lost model choices")
+			}
+			reject = false
+			_, save = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+			_, reload := model.Update(save())
+			model.Update(reload())
+			if strings.Join(saved.AllowedModels, ",") != "first,second" || saved.Model != "first" {
+				t.Fatal("child model selection did not save independently")
+			}
+			_, load = model.Update(tuiKey("e"))
+			model.Update(load())
+			if !model.allowedModels["second"] || !model.childModelsVisible() {
+				t.Fatal("saved model selection not restored")
+			}
+			for range 4 {
+				model.Update(tea.KeyMsg{Type: tea.KeyTab})
+			}
+			model.Update(tuiKey(" "))
+			model.Update(tea.KeyMsg{Type: tea.KeyDown})
+			model.Update(tuiKey(" "))
+			_, save = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
+			_, reload = model.Update(save())
+			model.Update(reload())
+			if len(saved.AllowedModels) != 0 {
+				t.Fatal("empty selection did not clear permissions")
+			}
+			_, load = model.Update(tuiKey("e"))
+			model.Update(load())
+			for range 3 {
+				model.Update(tea.KeyMsg{Type: tea.KeyTab})
+			}
+			if permission == "assign" {
+				model.Update(tea.KeyMsg{Type: tea.KeyRight})
+			}
+			model.Update(tuiKey(" "))
+			if model.childModelsVisible() {
+				t.Fatal("selector remained after disabling create_agent")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyTab})
+			if model.focus != 0 {
+				t.Fatal("hidden selector remained in tab order")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			if saves != 3 {
+				t.Fatal("cancel submitted changes")
+			}
+		})
+	}
+}
+
 func TestTUIToolPickerBoundsAndEmptyCatalog(t *testing.T) {
 	t.Chdir(t.TempDir())
 	if err := os.WriteFile("models.json", []byte(`{"models":[{"name":"test","provider":"openai"}]}`), 0o600); err != nil {
@@ -393,13 +517,14 @@ func TestTUISessionActorStyles(t *testing.T) {
 		{Role: "system", Content: "System instructions"},
 		envelopeMessage(api.Envelope{ID: "input-1", Source: "tui", Sender: "Jan", Content: "Please research this", ConversationID: "thread-1"}),
 		envelopeMessage(api.Envelope{ID: "input-2", Source: "agent", Sender: "researcher", Content: "Findings ready", ReplyTo: "input-1"}),
+		envelopeMessage(api.Envelope{ID: "failure-1", Source: "runtime", Sender: "runtime", Content: `{"event":"agent_blocked","agent":"researcher"}`, ConversationID: "thread-1", ReplyTo: "input-1"}),
 		{Role: "assistant", Content: "Checking now", ToolCalls: []api.ToolCall{{ID: "call-1", Name: "lookup", Arguments: json.RawMessage(`{"query":"facts","limit":2}`)}}},
 		{Role: "tool", ToolCallID: "call-1", Content: `{"answer":"found"}`},
 		{Role: "assistant", Content: "Final answer\n" + strings.Repeat("long-output", 25) + "\x1b]52;c;clipboard\a"},
 	}
 	model.renderContent()
 	plain := ansi.Strip(model.detail)
-	for _, label := range []string{"SYSTEM", "USER / Jan", "AGENT / researcher", "AGENT / coordinator", "TOOL RESULT / lookup", "Envelope: input-1", "Conversation: thread-1", "Reply to: input-1", "Tool call: lookup [call-1]", "Tool result: call-1", `  "query": "facts"`, `  "answer": "found"`} {
+	for _, label := range []string{"SYSTEM", "USER / Jan", "AGENT / researcher", "AGENT / coordinator", "RUNTIME / runtime", "agent_blocked", "TOOL RESULT / lookup", "Envelope: input-1", "Conversation: thread-1", "Reply to: input-1", "Tool call: lookup [call-1]", "Tool result: call-1", `  "query": "facts"`, `  "answer": "found"`} {
 		if !strings.Contains(plain, label) {
 			t.Errorf("missing session label or formatted JSON: %q", label)
 		}
@@ -610,6 +735,39 @@ func TestTUIErrorsAndCancellation(t *testing.T) {
 	_, command = model.Update(tuiKey("r"))
 	if !model.busy || command == nil {
 		t.Fatal("refresh did not start")
+	}
+}
+
+func TestTUIAgentStatus(t *testing.T) {
+	model := newTUI(t.Context(), nil)
+	model.busy = false
+	for _, status := range []string{"idle", "queued", "running", "paused"} {
+		model.page = "agents"
+		model.agents = []api.AgentSummary{{Name: "worker", Model: "test", Status: status}}
+		model.Update(tea.WindowSizeMsg{Width: 40, Height: 22})
+		model.renderContent()
+		if !strings.Contains(ansi.Strip(model.View()), strings.ToUpper(status)) {
+			t.Fatalf("agent status not visible: %s", status)
+		}
+		model.page = "inbox"
+		inbox := api.InboxState{Status: status}
+		if status == "paused" {
+			inbox.Error = "provider unavailable"
+		}
+		if status == "running" {
+			inbox.ActiveEnvelopeID = "active-1"
+		}
+		data, err := json.Marshal(inbox)
+		if err != nil {
+			t.Fatal(err)
+		}
+		model.Update(tuiResult{data: data})
+		if !strings.Contains(model.detail, strings.ToUpper(status)) {
+			t.Fatalf("inbox status not visible: %s", status)
+		}
+		if status == "running" && !strings.Contains(model.detail, "Active envelope: active-1") {
+			t.Fatal("active envelope not shown")
+		}
 	}
 }
 

@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +49,41 @@ func waitForInbox(t *testing.T, env *AgentEnvironment, name string, ready func([
 	}
 }
 
+func TestReplyRoutingInstructions(t *testing.T) {
+	custom := "Keep answers brief."
+	session := Session{Messages: []Message{
+		{Role: "system", Content: "Old instructions"},
+		{Role: "assistant", Content: "Previous answer"},
+	}}
+	if !setSessionInstructions(&session, custom) {
+		t.Fatal("existing session instructions were not refreshed")
+	}
+	env := &AgentEnvironment{}
+	var description string
+	for _, tool := range env.messagingTools("sender") {
+		if tool.Name == "message" {
+			description = tool.Description
+		}
+	}
+	for name, text := range map[string]string{"system": session.Messages[0].Content, "message": description} {
+		for _, rule := range []string{
+			`When Source is "agent", send substantive replies`,
+			`When Source is not "agent", reply with normal assistant text`,
+			`"tui" or "user"`,
+		} {
+			if !strings.Contains(text, rule) {
+				t.Errorf("%s instructions missing reply rule %q", name, rule)
+			}
+		}
+	}
+	if !strings.HasSuffix(session.Messages[0].Content, custom) || len(session.Messages) != 2 || session.Messages[1].Content != "Previous answer" {
+		t.Fatal("instruction refresh changed custom instructions or history")
+	}
+	if setSessionInstructions(&session, custom) {
+		t.Fatal("unchanged instructions should not require another refresh")
+	}
+}
+
 func TestAgentCreatesAndMessagesChild(t *testing.T) {
 	ctx, root, _ := setupPersistenceTest(t)
 	called := make(chan struct{}, 1)
@@ -65,7 +101,7 @@ func TestAgentCreatesAndMessagesChild(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer env.Close()
-	parent, err := env.CreateAgent(ctx, "test-model", []Tool{CreateAgentTool()}, "parent", "Delegate tasks", true)
+	parent, err := env.CreateAgentWithModels(ctx, "test-model", []Tool{CreateAgentTool()}, "parent", "Delegate tasks", true, []string{"test-model"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,6 +207,166 @@ func TestAgentsMessageWithoutWaitingForReplies(t *testing.T) {
 	}
 	for _, name := range []string{"sender", "recipient"} {
 		waitForInbox(t, env, name, func(inbox []Envelope, failure string) bool { return len(inbox) == 0 && failure == "" })
+	}
+}
+
+func TestAgentStatusAndFailureNotifications(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	env, err := NewAgentEnvironment(ctx, root, "status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(env.Close)
+	requester, err := env.CreateAgent(ctx, "test-model", nil, "requester", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := env.CreateAgent(ctx, "test-model", nil, "worker", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester.InboxError = "paused for inspection"
+	status, err := env.Status("worker")
+	if err != nil || status.Status != "idle" {
+		t.Fatalf("idle: %+v %v", status, err)
+	}
+	if _, err := env.Status("missing"); !errors.Is(err, ErrAgentNotFound) {
+		t.Fatal(err)
+	}
+	first, err := env.Message(ctx, Envelope{Source: "agent", Sender: "requester", To: "worker", Content: "First task", ConversationID: "thread"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := env.Message(ctx, Envelope{Source: "agent", Sender: "requester", To: "worker", Content: "Second task", ConversationID: "thread"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.Message(ctx, Envelope{Source: "tui", Sender: "tui", To: "worker", Content: "User task"}); err != nil {
+		t.Fatal(err)
+	}
+	status, _ = env.Status("worker")
+	if status.Status != "queued" || status.Pending != 3 || status.ActiveEnvelopeID != "" {
+		t.Fatalf("queued: %+v", status)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	worker.Client = messageTestModel{call: func(ctx context.Context, messages []Message) (Message, error) {
+		close(entered)
+		select {
+		case <-release:
+			return Message{}, errors.New("model unavailable")
+		case <-ctx.Done():
+			return Message{}, ctx.Err()
+		}
+	}}
+	if err := env.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("worker did not start")
+	}
+	status, _ = env.Status("worker")
+	if status.Status != "running" || status.ActiveEnvelopeID != first || status.Pending != 3 {
+		t.Fatalf("running: %+v", status)
+	}
+	close(release)
+	waitForInbox(t, env, "worker", func(inbox []Envelope, failure string) bool { return len(inbox) == 3 && failure != "" })
+	status, _ = env.Status("worker")
+	if status.Status != "paused" || status.ActiveEnvelopeID != "" || status.Error != "call client: model unavailable" {
+		t.Fatalf("paused: %+v", status)
+	}
+	notifications, _ := env.Inbox("requester")
+	if len(notifications.Messages) != 2 {
+		t.Fatalf("wanted two blocked-task notifications: %+v", notifications)
+	}
+	for index, requestID := range []string{first, second} {
+		notification := notifications.Messages[index]
+		var event map[string]string
+		if err := json.Unmarshal([]byte(notification.Content), &event); err != nil {
+			t.Fatal(err)
+		}
+		if notification.Source != "runtime" || notification.Sender != "runtime" || notification.To != "requester" || notification.ReplyTo != requestID || notification.ConversationID != "thread" || event["event"] != "agent_blocked" || event["envelope_id"] != requestID || event["failed_envelope_id"] != first || event["agent"] != "worker" || event["error"] != status.Error {
+			t.Fatalf("invalid notification: %+v", notification)
+		}
+	}
+	env.Close()
+	loaded, err := LoadAgentEnvironment(ctx, root, "status", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(loaded.Close)
+	if err := loaded.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	notifications, _ = loaded.Inbox("requester")
+	if len(notifications.Messages) != 2 {
+		t.Fatal("restart duplicated failure notifications")
+	}
+	for _, tool := range loaded.messagingTools("requester") {
+		switch tool.Name {
+		case "agent_status":
+			result, err := tool.Execute(ctx, json.RawMessage(`{"name":"worker"}`))
+			if err != nil || !strings.Contains(result, `"status":"paused"`) {
+				t.Fatalf("status tool: %s %v", result, err)
+			}
+		case "message":
+			result, err := tool.Execute(ctx, json.RawMessage(`{"to":"worker","content":"Late task"}`))
+			if err != nil || !strings.Contains(result, `"status":"paused"`) || !strings.Contains(result, `"status":"accepted"`) {
+				t.Fatalf("paused receipt: %s %v", result, err)
+			}
+		}
+	}
+	notifications, _ = loaded.Inbox("requester")
+	if len(notifications.Messages) != 3 {
+		t.Fatal("new task to paused recipient was not notified")
+	}
+	loaded.agentLocked("requester").Client = messageTestModel{call: func(ctx context.Context, messages []Message) (Message, error) {
+		return Message{}, errors.New("notification processing failed")
+	}}
+	if err := loaded.RetryInbox(ctx, "requester"); err != nil {
+		t.Fatal(err)
+	}
+	waitForInbox(t, loaded, "requester", func(inbox []Envelope, failure string) bool { return len(inbox) == 3 && failure != "" })
+	workerInbox, _ := loaded.Inbox("worker")
+	if len(workerInbox.Messages) != 4 {
+		t.Fatal("runtime notification failure created a notification loop")
+	}
+}
+
+func TestFailureNotificationSaveRollback(t *testing.T) {
+	ctx, root, _ := setupPersistenceTest(t)
+	env, err := NewAgentEnvironment(ctx, root, "rollback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := env.CreateAgent(ctx, "test-model", nil, "requester", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker, err := env.CreateAgent(ctx, "test-model", nil, "worker", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worker.InboxError = "unavailable"
+	previousRoot := env.DataRoot
+	env.DataRoot = filepath.Join(root, "blocked")
+	if err := os.WriteFile(env.DataRoot, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	request := Envelope{Source: "agent", Sender: "requester", To: "worker", Content: "Task"}
+	if _, err := env.Message(ctx, request); err == nil {
+		t.Fatal("save failure ignored")
+	}
+	if len(worker.Inbox) != 0 || len(requester.Inbox) != 0 || len(worker.notifiedFailures) != 0 {
+		t.Fatal("failed save left partial notification state")
+	}
+	env.DataRoot = previousRoot
+	if _, err := env.Message(ctx, request); err != nil {
+		t.Fatal(err)
+	}
+	if len(worker.Inbox) != 1 || len(requester.Inbox) != 1 || len(worker.notifiedFailures) != 1 {
+		t.Fatal("retry did not persist task and notification")
 	}
 }
 

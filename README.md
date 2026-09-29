@@ -31,6 +31,11 @@ socket, pass `--socket /path/to/micro.sock` to both commands.
   Ctrl+S saves and Esc cancels. Tool descriptions appear below the checklist.
   Memory and messaging tools are always enabled. Optional choices come from
   the running server's registry; clearing all choices keeps the automatic tools.
+  Selecting `create_agent` under Use or Assign reveals a Child models checklist
+  populated from `models.json`. Tab to it, use Up/Down to select a row, and Space
+  to toggle each permitted model. This list is separate from the agent's own
+  model; selecting none blocks child creation. Small terminals show fewer rows
+  and omit tool descriptions while this checklist is visible.
   Changes are persisted and require an idle agent with an empty inbox, including
   no paused work. The name is fixed and session history is preserved; editing
   instructions updates the session's system prompt.
@@ -76,12 +81,18 @@ default prompt. This creates a new agent; it does not update an existing agent.
 
 `message` prints the accepted envelope ID, not the recipient's answer. The agent's
 conversation and final output are saved in its session file. Each agent receives
-`list_agents` and `message` tools automatically, including after reload.
+`list_agents`, `agent_status`, and `message` tools automatically, including after reload.
 
 The model-facing `message` tool accepts `to`, `content`, and optional `reply_to`.
 The runtime supplies the sender identity and inherits the current conversation
 ID. Agents send replies explicitly using the incoming sender and envelope ID;
 final model output is not automatically sent back as another message.
+The tool's receipt includes a `recipient` status snapshot in addition to the
+accepted ID. `agent_status` accepts `{"name":"timekeeper"}` and reports `idle`,
+`queued`, `running`, or `paused`, the pending count (including active work), the
+active envelope ID when running, and any inbox error. These are agent processing
+states, not proof that a delegated task has been completed. The TUI displays them
+in agent lists and inbox views; refresh those views with `r`.
 
 CLI messages also support `--sender`, `--conversation`, and `--reply-to`.
 
@@ -89,14 +100,17 @@ CLI messages also support `--sender`, `--conversation`, and `--reply-to`.
 
 Enable the optional `create_agent` tool in an agent's create/edit tool checklist.
 It is available in the runtime catalogue but is not assigned automatically and
-is separate from `BuiltinTools()`. It calls the existing `CreateAgent` Go API in
+is separate from `BuiltinTools()`. It uses the shared agent-creation path in
 the caller's environment, including validation, persistence, and worker startup.
 
 The tool accepts `name`, `model` (a configured model name), optional
 `instructions`, and an optional `tools` array. Every requested tool must be in
 the caller's Assign list; Use alone does not permit delegation. The tool's
-description includes the allowed names and descriptions. For example, with
-Assign enabled for `get_time`:
+description includes the allowed names and descriptions. The model parameter's
+schema lists only configured models selected in the caller's Child models list;
+the runtime enforces that list even if a model returns an unlisted name.
+For example, with Assign enabled for `get_time` and `gpt-5.4-mini` selected as
+a child model:
 
 ```json
 {"name":"researcher","model":"gpt-5.4-mini","instructions":"Research assigned questions and message the sender with your findings.","tools":["get_time"]}
@@ -109,17 +123,27 @@ requested usable tools, but no Assign permissions. Omitting `tools` or using
 not let that child grant optional tools of its own. Unknown, unauthorized, or
 duplicate tool names reject the whole creation request. Existing agents have
 no Assign permissions until explicitly configured; Use is not upgraded to Assign.
+Children granted Use of `create_agent` inherit a copy of the parent's child-model
+allowlist, but still receive no Assign tool permissions. They may create children
+using those models with automatic tools only. Model limits do not change the
+agent's own model and are not automatically widened when models are added to
+configuration. Updating a parent's limits does not change existing children's
+copies. Existing agents without a saved allowlist cannot create children until
+models are explicitly selected, even if they already have Use of `create_agent`.
 Creating an agent does not itself enqueue a task or change the initial agent.
 Duplicate names fail rather than replacing existing agents. Only grant this
 tool to agents trusted to create persistent workers; there is no agent-count
 or spending limit enforced by this tool.
 
-For Go callers, assign `api.CreateAgentTool()` through `env.CreateAgent` or
+For Go callers, assign `api.CreateAgentTool()` through `env.CreateAgentWithModels` or
 `env.SetAgentTools`, and register it as `registry["create_agent"]` when loading
 saved environments. The environment binds the tool when it is assigned.
 `CreateAgent` and `UpdateAgent` accept optional trailing assignable `Tool` values,
-independent of the usable `[]Tool` argument. `UpdateAgent` replaces both lists
-(omitted assignable values clear grants); `SetAgentTools` changes only Use.
+independent of the usable `[]Tool` argument. `CreateAgentWithModels` and
+`UpdateAgentWithModels` additionally accept an explicit `[]string` child-model
+allowlist before the variadic assignable tools. The older methods supply an empty
+allowlist. Full updates replace all permissions; `SetAgentTools` changes only Use
+and preserves Assign and child-model permissions.
 All assignable tools must also be in the registry used to restore the environment.
 
 ## Delivery and recovery
@@ -137,6 +161,24 @@ All assignable tools must also be in the registry used to restore the environmen
 go run main.go environment retry-inbox team researcher
 ```
 
+When an inbox pauses, the runtime queues an `agent_blocked` notification to the
+sender of each blocked agent-origin envelope, including requests behind the failed
+one. New agent requests sent to an already paused inbox are also notified. The
+notification uses `Source: "runtime"`, `ReplyTo` matching the blocked request ID,
+and the original conversation ID. Its JSON content identifies the recipient,
+failed envelope, affected request, and error. The original requests stay queued;
+there is no automatic retry or cancellation.
+
+Notifications and their deduplication markers are saved with the paused state.
+Restarting does not resend notices already saved, including notices already
+consumed by the requester. An explicit retry starts a new attempt and can produce
+new notices if it fails again. Runtime notices never produce failure-notification
+loops. A paused requester receives notices in its queue but cannot process them
+until it too is retried. External users inspect failures through the inbox/API;
+runtime notices are delivered only to agent senders. Persistence failures can
+prevent notices from being saved; these failures are logged, and notification
+delivery is retried on restart or a later send to the paused inbox.
+
 Completed session turns are recognized when acknowledging an inbox message is
 interrupted. Persisted tool results are reused when resuming incomplete turns.
 This is not an exactly-once guarantee: a crash after a tool side effect but before
@@ -149,7 +191,7 @@ Use one process per environment data directory.
 
 Create or load an environment and its agents, then call `env.Start(ctx)` to
 start workers. Submit `env.Message(ctx, api.Envelope{...})`, inspect with
-`env.Inbox(name)`, and use `env.RetryInbox(ctx, name)` for paused work. Call
+`env.Inbox(name)` or `env.Status(name)`, and use `env.RetryInbox(ctx, name)` for paused work. Call
 `env.Close()` to cancel workers, preserve unfinished messages, and wait for them
 to exit.
 
@@ -158,25 +200,31 @@ The Unix-socket API exposes:
 - `GET /tools`: registered optional tool names and descriptions.
 - `POST /environments/{id}/agents/{name}?model=...&tool=get_time`: create an
   agent with optional repeated `tool` (Use) and `assignable_tool` (Assign)
-  query parameters and `instructions`.
+  query parameters, repeated `allowed_model` child-model permissions, and `instructions`.
 - `PUT /environments/{id}/agents/{name}?model=...&instructions=...&tool=get_time`:
   replace model, instructions, Use tools, and Assign tools while preserving identity
   and session history. Repeated `assignable_tool` parameters set Assign permissions.
-  Omitted instructions/tools/assignable tools clear those settings. Returns 204
+  Repeated `allowed_model` parameters replace child-model permissions.
+  Omitted instructions/tools/assignable tools/allowed models clear those settings. Returns 204
   on success, 400 for invalid settings, or 409 when the agent is busy.
 - `PUT /environments/{id}/agents/{name}/tools`: replace optional tool assignments
   with a JSON array of registered names, such as `["get_time"]` or `[]`.
-  This changes only Use permissions and preserves Assign permissions.
+  This changes only Use permissions and preserves Assign and child-model permissions.
   Returns 204 on success, 400 for invalid tools, or 409 when the agent is busy.
 - `GET /environments/{id}/agents`: agent names, models, custom instructions,
-  optional `tools`, `assignable_tools`, pending-message counts, and any inbox error.
+  optional `tools`, `assignable_tools`, `allowed_models`, processing `status`,
+  `active_envelope_id` when running, pending-message counts, and any inbox error.
+- `GET /environments/{id}/agents/{name}/status`: name, processing status, pending
+  count, active envelope ID when running, and any inbox error.
 - `GET /environments/{id}/agents/{name}/session`: the latest committed session
   snapshot (`messages`), available even while the agent is processing work.
 - `POST /environments/{id}/messages`: an `Envelope` JSON object using the Go field
   names (`Source`, `Sender`, `To`, `Content`, `ConversationID`, `ReplyTo`, optional
-  `ID`); returns HTTP 202 with `id` and `status`.
-- `GET /environments/{id}/agents/{name}/inbox`: pending `messages` and an optional
-  `error` describing why the inbox is paused.
+  `ID`); returns HTTP 202 with `id` and `status`. Sources `agent` and `runtime`
+  are reserved and rejected from external HTTP clients.
+- `GET /environments/{id}/agents/{name}/inbox`: pending `messages`, processing
+  `status`, active envelope ID when running, and an optional `error` describing
+  why the inbox is paused.
 - `POST /environments/{id}/agents/{name}/inbox/retry`: resume a paused inbox.
 
 The socket is owner-only. External adapters must authenticate their own callers;

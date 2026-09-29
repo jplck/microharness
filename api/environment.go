@@ -46,8 +46,10 @@ type AgentState struct {
 	SessionID           string     `json:"session_id"`
 	ToolNames           []string   `json:"tools,omitempty"`
 	AssignableToolNames []string   `json:"assignable_tools,omitempty"`
+	AllowedModels       []string   `json:"allowed_models,omitempty"`
 	Inbox               []Envelope `json:"inbox,omitempty"`
 	InboxError          string     `json:"inbox_error,omitempty"`
+	NotifiedFailures    []string   `json:"notified_failures,omitempty"`
 }
 
 func NewAgentEnvironment(ctx context.Context, dataRoot, name string) (*AgentEnvironment, error) {
@@ -125,12 +127,13 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 			}
 			assignableTools = append(assignableTools, tool)
 		}
-		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID, assignableTools...)
+		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID, saved.AllowedModels, assignableTools...)
 		if err != nil {
 			return nil, fmt.Errorf("restore agent %q: %w", saved.Name, err)
 		}
 		agent.Inbox = saved.Inbox
 		agent.InboxError = saved.InboxError
+		agent.notifiedFailures = saved.NotifiedFailures
 		env.Agents = append(env.Agents, agent)
 		if saved.Name == state.InitialAgentName {
 			env.InitialAgent = agent
@@ -156,7 +159,9 @@ func (env *AgentEnvironment) saveLocked() error {
 			Name: agent.Name, ModelName: agent.ModelName, Instructions: agent.Instructions,
 			SessionID: agent.Session.SessionID, ToolNames: agent.ToolNames, Inbox: agent.Inbox,
 			InboxError:          agent.InboxError,
+			NotifiedFailures:    agent.notifiedFailures,
 			AssignableToolNames: agent.AssignableToolNames,
+			AllowedModels:       agent.AllowedModels,
 		})
 	}
 	if err := writeJSONAtomic(filepath.Join(env.DataRoot, "environment.json"), state); err != nil {

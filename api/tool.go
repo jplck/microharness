@@ -25,10 +25,11 @@ type Parameter struct {
 	Description string        `json:"description"`
 	Required    bool          `json:"required"`
 	Items       ParameterType `json:"items,omitempty"`
+	Enum        []string      `json:"enum,omitempty"`
 }
 
 type Tool struct {
-	bindEnvironment func(*AgentEnvironment, string, []Tool) Tool
+	bindEnvironment func(*AgentEnvironment, string, []Tool, []string) Tool
 	Name            string
 	Description     string
 	Parameters      []Parameter
@@ -51,6 +52,9 @@ func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {
 		}
 		if p.Type == Array {
 			property["items"] = map[string]any{"type": string(p.Items)}
+		}
+		if len(p.Enum) > 0 {
+			property["enum"] = p.Enum
 		}
 		properties[p.Name] = property
 		if p.Required {
