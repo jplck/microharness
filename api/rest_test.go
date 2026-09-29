@@ -210,17 +210,20 @@ func TestRuntimeToolSelection(t *testing.T) {
 		return data
 	}
 	var catalog []ToolSummary
-	if err := json.Unmarshal(request("GET", "/tools", "", 200), &catalog); err != nil || len(catalog) != 1 || catalog[0].Name != "get_time" {
+	if err := json.Unmarshal(request("GET", "/tools", "", 200), &catalog); err != nil || len(catalog) != 2 || catalog[0].Name != "create_agent" || catalog[1].Name != "get_time" {
 		t.Fatalf("tool catalog: %+v %v", catalog, err)
 	}
 	request("POST", "/environments/tools", "", 201)
-	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message"} {
+	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message", "assignable_tool=missing", "assignable_tool=get_time&assignable_tool=get_time", "assignable_tool=message"} {
 		request("POST", "/environments/tools/agents/assistant?model=test-model&"+query, "", 400)
 	}
-	request("POST", "/environments/tools/agents/assistant?model=test-model&tool=get_time", "", 201)
+	request("POST", "/environments/tools/agents/assistant?model=test-model&tool=get_time&assignable_tool=create_agent", "", 201)
 	var agents []AgentSummary
 	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || len(agents) != 1 || !reflect.DeepEqual(agents[0].Tools, []string{"get_time"}) {
 		t.Fatalf("agent tools: %+v %v", agents, err)
+	}
+	if !reflect.DeepEqual(agents[0].AssignableTools, []string{"create_agent"}) {
+		t.Fatal("assign-only permission not returned")
 	}
 	for _, body := range []string{`["missing"]`, `["get_time","get_time"]`, `null`, `{}`, `[] []`} {
 		request("PUT", "/environments/tools/agents/assistant/tools", body, 400)
@@ -229,26 +232,40 @@ func TestRuntimeToolSelection(t *testing.T) {
 	request("PUT", "/environments/tools/agents/assistant/tools", `[]`, 204)
 	request("PUT", "/environments/tools/agents/assistant/tools", `["get_time"]`, 204)
 	instructions := "Updated instructions\nKeep sources & caveats."
-	update := "/environments/tools/agents/assistant?" + url.Values{"model": {"other-model"}, "instructions": {instructions}, "tool": {"get_time"}}.Encode()
+	update := "/environments/tools/agents/assistant?" + url.Values{"model": {"other-model"}, "instructions": {instructions}, "tool": {"get_time"}, "assignable_tool": {"get_time"}}.Encode()
 	request("PUT", update, "", 204)
-	for _, query := range []string{"model=missing", "model=test-model&tool=missing", "model=test-model&tool=get_time&tool=get_time"} {
+	for _, query := range []string{"model=missing", "model=test-model&tool=missing", "model=test-model&tool=get_time&tool=get_time", "model=test-model&assignable_tool=missing", "model=test-model&assignable_tool=get_time&assignable_tool=get_time"} {
 		request("PUT", "/environments/tools/agents/assistant?"+query, "", 400)
 	}
 	request("PUT", "/environments/tools/agents/missing?model=test-model", "", 404)
 	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || agents[0].Model != "other-model" || agents[0].Instructions != instructions || !reflect.DeepEqual(agents[0].Tools, []string{"get_time"}) {
 		t.Fatalf("updated agent settings: %+v %v", agents, err)
 	}
+	if !reflect.DeepEqual(agents[0].AssignableTools, []string{"get_time"}) {
+		t.Fatal("update did not replace assign permissions")
+	}
+	request("PUT", "/environments/tools/agents/assistant?model=other-model&tool=get_time", "", 204)
+	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || len(agents[0].AssignableTools) != 0 {
+		t.Fatal("omitted assign permissions were not cleared")
+	}
+	request("PUT", update, "", 204)
 	var session Session
 	if err := json.Unmarshal(request("GET", "/environments/tools/agents/assistant/session", "", 200), &session); err != nil || len(session.Messages) == 0 || session.Messages[0].Content != agentInstructions(instructions) {
 		t.Fatalf("updated session instructions: %+v %v", session, err)
 	}
+	request("PUT", "/environments/tools/agents/assistant/tools", `["get_time","create_agent"]`, 204)
 	stop()
-	loaded, err := LoadAgentEnvironment(ctx, root, "tools", BuiltinTools())
+	registry := BuiltinTools()
+	registry["create_agent"] = CreateAgentTool()
+	loaded, err := LoadAgentEnvironment(ctx, root, "tools", registry)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(loaded.Agents[0].ToolNames, []string{"get_time"}) {
+	if !reflect.DeepEqual(loaded.Agents[0].ToolNames, []string{"get_time", "create_agent"}) {
 		t.Fatal("tool edit did not survive restart")
+	}
+	if !reflect.DeepEqual(loaded.Agents[0].AssignableToolNames, []string{"get_time"}) {
+		t.Fatal("use-only update or restart lost assign permissions")
 	}
 	if loaded.Agents[0].ModelName != "other-model" || loaded.Agents[0].Instructions != instructions || loaded.Agents[0].Session.Messages[0].Content != agentInstructions(instructions) {
 		t.Fatal("agent edit did not survive restart")

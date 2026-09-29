@@ -24,7 +24,10 @@ socket, pass `--socket /path/to/micro.sock` to both commands.
   selector, optional multiline instructions, and a tool checklist.
 - Press `e` on the agent list to edit its model, instructions, and tools using
   the same form as creation, prefilled with its current settings.
-  In the tools field, Up/Down selects a tool and Space toggles its checkbox;
+  Each tool has independent Use and Assign checkboxes: Use lets the agent call
+  it; Assign lets `create_agent` grant it to a child without needing Use.
+  In the tools field, Up/Down selects a tool, Left/Right selects Use or Assign,
+  and Space toggles that checkbox;
   Ctrl+S saves and Esc cancels. Tool descriptions appear below the checklist.
   Memory and messaging tools are always enabled. Optional choices come from
   the running server's registry; clearing all choices keeps the automatic tools.
@@ -82,6 +85,43 @@ final model output is not automatically sent back as another message.
 
 CLI messages also support `--sender`, `--conversation`, and `--reply-to`.
 
+## Autonomous agent creation
+
+Enable the optional `create_agent` tool in an agent's create/edit tool checklist.
+It is available in the runtime catalogue but is not assigned automatically and
+is separate from `BuiltinTools()`. It calls the existing `CreateAgent` Go API in
+the caller's environment, including validation, persistence, and worker startup.
+
+The tool accepts `name`, `model` (a configured model name), optional
+`instructions`, and an optional `tools` array. Every requested tool must be in
+the caller's Assign list; Use alone does not permit delegation. The tool's
+description includes the allowed names and descriptions. For example, with
+Assign enabled for `get_time`:
+
+```json
+{"name":"researcher","model":"gpt-5.4-mini","instructions":"Research assigned questions and message the sender with your findings.","tools":["get_time"]}
+```
+
+After creation, the parent uses `message` to delegate work to the returned name.
+Children receive automatic memory and messaging tools plus the explicitly
+requested usable tools, but no Assign permissions. Omitting `tools` or using
+`[]` grants no optional tools. Granting Use of `create_agent` to a child does
+not let that child grant optional tools of its own. Unknown, unauthorized, or
+duplicate tool names reject the whole creation request. Existing agents have
+no Assign permissions until explicitly configured; Use is not upgraded to Assign.
+Creating an agent does not itself enqueue a task or change the initial agent.
+Duplicate names fail rather than replacing existing agents. Only grant this
+tool to agents trusted to create persistent workers; there is no agent-count
+or spending limit enforced by this tool.
+
+For Go callers, assign `api.CreateAgentTool()` through `env.CreateAgent` or
+`env.SetAgentTools`, and register it as `registry["create_agent"]` when loading
+saved environments. The environment binds the tool when it is assigned.
+`CreateAgent` and `UpdateAgent` accept optional trailing assignable `Tool` values,
+independent of the usable `[]Tool` argument. `UpdateAgent` replaces both lists
+(omitted assignable values clear grants); `SetAgentTools` changes only Use.
+All assignable tools must also be in the registry used to restore the environment.
+
 ## Delivery and recovery
 
 - Sending persists an envelope before returning its ID. An empty `To` in the Go
@@ -117,16 +157,19 @@ The Unix-socket API exposes:
 
 - `GET /tools`: registered optional tool names and descriptions.
 - `POST /environments/{id}/agents/{name}?model=...&tool=get_time`: create an
-  agent with optional repeated `tool` query parameters and `instructions`.
+  agent with optional repeated `tool` (Use) and `assignable_tool` (Assign)
+  query parameters and `instructions`.
 - `PUT /environments/{id}/agents/{name}?model=...&instructions=...&tool=get_time`:
-  replace model, instructions, and optional tools while preserving identity and
-  session history. Omitted instructions/tools clear those settings. Returns 204
+  replace model, instructions, Use tools, and Assign tools while preserving identity
+  and session history. Repeated `assignable_tool` parameters set Assign permissions.
+  Omitted instructions/tools/assignable tools clear those settings. Returns 204
   on success, 400 for invalid settings, or 409 when the agent is busy.
 - `PUT /environments/{id}/agents/{name}/tools`: replace optional tool assignments
   with a JSON array of registered names, such as `["get_time"]` or `[]`.
+  This changes only Use permissions and preserves Assign permissions.
   Returns 204 on success, 400 for invalid tools, or 409 when the agent is busy.
 - `GET /environments/{id}/agents`: agent names, models, custom instructions,
-  optional `tools`, pending-message counts, and any inbox error.
+  optional `tools`, `assignable_tools`, pending-message counts, and any inbox error.
 - `GET /environments/{id}/agents/{name}/session`: the latest committed session
   snapshot (`messages`), available even while the agent is processing work.
 - `POST /environments/{id}/messages`: an `Envelope` JSON object using the Go field

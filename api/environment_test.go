@@ -27,6 +27,205 @@ func setupPersistenceTest(t *testing.T) (context.Context, string, ToolRegistry) 
 	return t.Context(), t.TempDir(), registry
 }
 
+func TestCreateAgentTool(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	registry["create_agent"] = CreateAgentTool()
+	env, err := NewAgentEnvironment(ctx, root, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := env.CreateAgent(ctx, "test-model", []Tool{registry["create_agent"]}, "parent", "Delegate tasks", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	findCreate := func(agent *Agent) Tool {
+		t.Helper()
+		for _, tool := range agent.Tools {
+			if tool.Name == "create_agent" {
+				return tool
+			}
+		}
+		t.Fatal("missing create_agent tool")
+		return Tool{}
+	}
+	create := findCreate(parent)
+	result, err := create.Execute(ctx, json.RawMessage(`{"name":"researcher","model":"test-model","instructions":"Research and reply to the sender"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var receipt map[string]string
+	if err := json.Unmarshal([]byte(result), &receipt); err != nil || receipt["name"] != "researcher" || receipt["status"] != "created" {
+		t.Fatalf("invalid receipt: %s %v", result, err)
+	}
+	if len(env.Agents) != 2 || env.InitialAgent != parent {
+		t.Fatal("creation changed initial agent or failed to add child")
+	}
+	child := env.Agents[1]
+	if child.Instructions != "Research and reply to the sender" || len(child.ToolNames) != 0 || len(child.Tools) != 5 {
+		t.Fatal("child did not get requested instructions and only automatic tools")
+	}
+	for _, test := range []struct {
+		arguments string
+		want      error
+	}{
+		{`{"name":"researcher","model":"test-model"}`, ErrAgentExists},
+		{`{"name":"../invalid","model":"test-model"}`, ErrInvalidName},
+		{`{"name":"invalid-model","model":"missing"}`, ErrModelNotFound},
+	} {
+		if _, err := create.Execute(ctx, json.RawMessage(test.arguments)); !errors.Is(err, test.want) {
+			t.Fatalf("%s: %v", test.arguments, err)
+		}
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{`)); err == nil {
+		t.Fatal("invalid JSON accepted")
+	}
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := create.Execute(cancelled, json.RawMessage(`{"name":"cancelled","model":"test-model"}`)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation: %v", err)
+	}
+	loaded, err := LoadAgentEnvironment(ctx, root, "team", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Agents) != 2 || loaded.Agents[1].Session.SessionID != child.Session.SessionID {
+		t.Fatal("child not persisted")
+	}
+	if _, err := findCreate(loaded.InitialAgent).Execute(ctx, json.RawMessage(`{"name":"restored-child","model":"test-model"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Agents) != 3 || len(env.Agents) != 2 {
+		t.Fatal("restored tool bound to wrong environment")
+	}
+	if _, ok := BuiltinTools()["create_agent"]; ok {
+		t.Fatal("creation tool registered as a default builtin")
+	}
+}
+
+func TestCreateAgentToolAssignments(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	registry["create_agent"], registry["get_time"] = CreateAgentTool(), BuiltinTools()["get_time"]
+	env, err := NewAgentEnvironment(ctx, root, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	usable := []Tool{registry["create_agent"], registry["echo"]}
+	assignable := []Tool{registry["get_time"], registry["create_agent"]}
+	parent, err := env.CreateAgent(ctx, "test-model", usable, "parent", "", true, assignable...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	find := func(agent *Agent, name string) Tool {
+		t.Helper()
+		for _, tool := range agent.Tools {
+			if tool.Name == name {
+				return tool
+			}
+		}
+		t.Fatalf("missing tool %s", name)
+		return Tool{}
+	}
+	create := find(parent, "create_agent")
+	if !strings.Contains(create.Description, `"name":"get_time"`) {
+		t.Fatal("grant-only tool not discoverable")
+	}
+	for _, tool := range parent.Tools {
+		if tool.Name == "get_time" {
+			t.Fatal("assign permission granted use permission")
+		}
+	}
+	schema, err := json.Marshal(create.AsOpenAITool())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var definition struct {
+		Function struct {
+			Parameters struct {
+				Properties map[string]struct {
+					Type  string
+					Items struct{ Type string }
+				}
+			}
+		}
+	}
+	if err := json.Unmarshal(schema, &definition); err != nil {
+		t.Fatal(err)
+	}
+	if property := definition.Function.Parameters.Properties["tools"]; property.Type != "array" || property.Items.Type != "string" {
+		t.Fatalf("invalid tools schema: %s", schema)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"child","model":"test-model","tools":["get_time","create_agent"]}`)); err != nil {
+		t.Fatal(err)
+	}
+	child := env.Agents[1]
+	if !reflect.DeepEqual(child.ToolNames, []string{"get_time", "create_agent"}) || len(child.AssignableTools) != 0 {
+		t.Fatal("child use/assign permissions incorrect")
+	}
+	if _, err := find(child, "get_time").Execute(ctx, json.RawMessage(`{"location":"UTC"}`)); err != nil {
+		t.Fatal(err)
+	}
+	for _, arguments := range []string{
+		`{"name":"denied","model":"test-model","tools":["echo"]}`,
+		`{"name":"denied","model":"test-model","tools":["missing"],"caller":"parent"}`,
+		`{"name":"denied","model":"test-model","tools":["get_time","get_time"]}`,
+		`{"name":"denied","model":"test-model","tools":["message"]}`,
+	} {
+		if _, err := create.Execute(ctx, json.RawMessage(arguments)); !errors.Is(err, ErrInvalidTool) {
+			t.Fatalf("invalid grant accepted: %s: %v", arguments, err)
+		}
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"denied","model":"test-model","tools":"get_time"}`)); err == nil {
+		t.Fatal("non-array accepted")
+	}
+	if _, err := find(child, "create_agent").Execute(ctx, json.RawMessage(`{"name":"denied","model":"test-model","tools":["get_time"],"caller":"parent"}`)); !errors.Is(err, ErrInvalidTool) {
+		t.Fatalf("child borrowed parent grants: %v", err)
+	}
+	if len(env.Agents) != 2 {
+		t.Fatal("rejected request created an agent")
+	}
+	loaded, err := LoadAgentEnvironment(ctx, root, "team", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.InitialAgent.AssignableToolNames, []string{"get_time", "create_agent"}) {
+		t.Fatal("grant permissions not restored")
+	}
+	if _, err := find(loaded.InitialAgent, "create_agent").Execute(ctx, json.RawMessage(`{"name":"restored-child","model":"test-model","tools":["get_time"]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.SetAgentTools(ctx, "parent", usable); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(find(parent, "create_agent").Description, `"name":"get_time"`) {
+		t.Fatal("use-only update lost grant catalogue")
+	}
+	previousRoot := env.DataRoot
+	env.DataRoot = filepath.Join(root, "blocked")
+	if err := os.WriteFile(env.DataRoot, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = env.UpdateAgent(ctx, "parent", "test-model", "", usable)
+	env.DataRoot = previousRoot
+	if err == nil || !reflect.DeepEqual(parent.AssignableToolNames, []string{"get_time", "create_agent"}) {
+		t.Fatal("failed update lost permissions")
+	}
+	if err := env.UpdateAgent(ctx, "parent", "test-model", "", usable); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"revoked","model":"test-model","tools":["get_time"]}`)); !errors.Is(err, ErrInvalidTool) {
+		t.Fatalf("stale closure retained revoked grants: %v", err)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"empty","model":"test-model","tools":[]}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.SetAgentTools(ctx, "parent", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := create.Execute(ctx, json.RawMessage(`{"name":"revoked","model":"test-model"}`)); !errors.Is(err, ErrInvalidTool) {
+		t.Fatalf("revoked creation still allowed: %v", err)
+	}
+}
+
 func TestSetAgentTools(t *testing.T) {
 	ctx, root, registry := setupPersistenceTest(t)
 	env, err := NewAgentEnvironment(ctx, root, "test")

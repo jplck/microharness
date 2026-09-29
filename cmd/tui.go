@@ -63,6 +63,8 @@ type tuiModel struct {
 	modelIndex        int
 	toolChoices       []api.ToolSummary
 	selectedTools     map[string]bool
+	assignableTools   map[string]bool
+	assignPermission  bool
 	toolCursor        int
 	sessionGeneration uint64
 	sessionLoading    bool
@@ -363,6 +365,8 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 	model.form, model.focus, model.modelIndex = kind, 0, 0
 	model.toolChoices, model.toolCursor = nil, 0
 	model.selectedTools = make(map[string]bool)
+	model.assignableTools = make(map[string]bool)
+	model.assignPermission = false
 	model.status, model.failed = "", false
 	model.labels = []string{"Name"}
 	if kind == "agent" {
@@ -414,6 +418,9 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 			for _, name := range existing.Tools {
 				model.selectedTools[name] = true
 			}
+			for _, name := range existing.AssignableTools {
+				model.assignableTools[name] = true
+			}
 		}
 		return model.loadTools()
 	}
@@ -430,9 +437,9 @@ func (model tuiModel) toolPickerFocused() bool {
 	return model.form == "agent" && model.focus == len(model.inputs)+1
 }
 
-func (model tuiModel) toolSelection() []string {
+func selectedToolNames(selection map[string]bool) []string {
 	names := []string{}
-	for name, selected := range model.selectedTools {
+	for name, selected := range selection {
 		if selected {
 			names = append(names, name)
 		}
@@ -479,6 +486,10 @@ func (model *tuiModel) updateForm(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if model.toolPickerFocused() {
 			switch key.String() {
+			case "left", "h":
+				model.assignPermission = false
+			case "right", "l":
+				model.assignPermission = true
 			case "up", "k":
 				model.toolCursor = max(0, model.toolCursor-1)
 			case "down", "j":
@@ -486,7 +497,11 @@ func (model *tuiModel) updateForm(message tea.Msg) (tea.Model, tea.Cmd) {
 			case " ":
 				if len(model.toolChoices) > 0 {
 					name := model.toolChoices[model.toolCursor].Name
-					model.selectedTools[name] = !model.selectedTools[name]
+					selection := model.selectedTools
+					if model.assignPermission {
+						selection = model.assignableTools
+					}
+					selection[name] = !selection[name]
 				}
 			}
 			return model, nil
@@ -529,8 +544,11 @@ func (model *tuiModel) submit() tea.Cmd {
 			first, method = model.editingAgent, http.MethodPut
 		}
 		query := url.Values{"model": {model.inputs[1].Value()}, "instructions": {model.text.Value()}}
-		for _, name := range model.toolSelection() {
+		for _, name := range selectedToolNames(model.selectedTools) {
 			query.Add("tool", name)
+		}
+		for _, name := range selectedToolNames(model.assignableTools) {
+			query.Add("assignable_tool", name)
 		}
 		path = agentPath(model.environment, first) + "?" + query.Encode()
 	case "message":
@@ -677,14 +695,22 @@ func (model tuiModel) renderToolPicker() string {
 	var choices []string
 	for index := start; index < min(len(model.toolChoices), start+rows); index++ {
 		tool := model.toolChoices[index]
-		mark, pointer := "[ ]", "  "
+		mark, grant, pointer := "[ ]", "[ ]", "  "
 		if model.selectedTools[tool.Name] {
 			mark = "[x]"
 		}
+		if model.assignableTools[tool.Name] {
+			grant = "[x]"
+		}
 		if model.toolPickerFocused() && index == model.toolCursor {
 			pointer = "> "
+			if model.assignPermission {
+				grant = lipgloss.NewStyle().Reverse(true).Render(grant)
+			} else {
+				mark = lipgloss.NewStyle().Reverse(true).Render(mark)
+			}
 		}
-		line := pointer + mark + " " + terminalText(tool.Name)
+		line := pointer + mark + " " + grant + "    " + terminalText(tool.Name)
 		line = lipgloss.NewStyle().MaxWidth(model.width - 4).MaxHeight(1).Render(line)
 		if model.toolPickerFocused() && index == model.toolCursor {
 			line = lipgloss.NewStyle().Foreground(lipgloss.Color("45")).Render(line)
@@ -698,7 +724,7 @@ func (model tuiModel) renderToolPicker() string {
 	if len(model.toolChoices) > 0 {
 		description = terminalText(model.toolChoices[model.toolCursor].Description)
 	}
-	return "Tools\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\n" +
+	return "  Use Assign Tool\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\n" +
 		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).MaxWidth(model.width-4).MaxHeight(1).Render(description) + "\n" +
 		"Memory + messaging: always enabled"
 }
@@ -755,7 +781,7 @@ func (model tuiModel) View() string {
 		body = form.String()
 		help = "tab/shift+tab field | ctrl+s submit | esc cancel | ctrl+c quit"
 		if model.toolPickerFocused() {
-			help = "up/down select | space toggle | tab field | ctrl+s save | esc cancel"
+			help = "arrows select | space toggle | tab next | ctrl+s save | esc cancel"
 		}
 	}
 	status := terminalText(model.status)

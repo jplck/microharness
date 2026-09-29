@@ -40,13 +40,14 @@ type EnvironmentState struct {
 }
 
 type AgentState struct {
-	Name         string     `json:"name"`
-	ModelName    string     `json:"model_name"`
-	Instructions string     `json:"instructions,omitempty"`
-	SessionID    string     `json:"session_id"`
-	ToolNames    []string   `json:"tools,omitempty"`
-	Inbox        []Envelope `json:"inbox,omitempty"`
-	InboxError   string     `json:"inbox_error,omitempty"`
+	Name                string     `json:"name"`
+	ModelName           string     `json:"model_name"`
+	Instructions        string     `json:"instructions,omitempty"`
+	SessionID           string     `json:"session_id"`
+	ToolNames           []string   `json:"tools,omitempty"`
+	AssignableToolNames []string   `json:"assignable_tools,omitempty"`
+	Inbox               []Envelope `json:"inbox,omitempty"`
+	InboxError          string     `json:"inbox_error,omitempty"`
 }
 
 func NewAgentEnvironment(ctx context.Context, dataRoot, name string) (*AgentEnvironment, error) {
@@ -111,12 +112,20 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 		tools := make([]Tool, 0, len(saved.ToolNames))
 		for _, toolName := range saved.ToolNames {
 			tool, ok := registry[toolName]
-			if !ok || tool.Name != toolName || tool.Execute == nil {
+			if !ok || tool.Name != toolName || (tool.Execute == nil && tool.bindEnvironment == nil) {
 				return nil, fmt.Errorf("agent %q requires registered tool %q", saved.Name, toolName)
 			}
 			tools = append(tools, tool)
 		}
-		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID)
+		assignableTools := make([]Tool, 0, len(saved.AssignableToolNames))
+		for _, toolName := range saved.AssignableToolNames {
+			tool, ok := registry[toolName]
+			if !ok || tool.Name != toolName {
+				return nil, fmt.Errorf("agent %q requires registered assignable tool %q", saved.Name, toolName)
+			}
+			assignableTools = append(assignableTools, tool)
+		}
+		agent, err := env.createAgent(ctx, saved.ModelName, tools, saved.Name, saved.Instructions, saved.SessionID, assignableTools...)
 		if err != nil {
 			return nil, fmt.Errorf("restore agent %q: %w", saved.Name, err)
 		}
@@ -146,7 +155,8 @@ func (env *AgentEnvironment) saveLocked() error {
 		state.Agents = append(state.Agents, AgentState{
 			Name: agent.Name, ModelName: agent.ModelName, Instructions: agent.Instructions,
 			SessionID: agent.Session.SessionID, ToolNames: agent.ToolNames, Inbox: agent.Inbox,
-			InboxError: agent.InboxError,
+			InboxError:          agent.InboxError,
+			AssignableToolNames: agent.AssignableToolNames,
 		})
 	}
 	if err := writeJSONAtomic(filepath.Join(env.DataRoot, "environment.json"), state); err != nil {

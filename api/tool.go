@@ -16,6 +16,7 @@ const (
 	Integer ParameterType = "integer"
 	Number  ParameterType = "number"
 	Boolean ParameterType = "boolean"
+	Array   ParameterType = "array"
 )
 
 type Parameter struct {
@@ -23,13 +24,15 @@ type Parameter struct {
 	Type        ParameterType `json:"type"`
 	Description string        `json:"description"`
 	Required    bool          `json:"required"`
+	Items       ParameterType `json:"items,omitempty"`
 }
 
 type Tool struct {
-	Name        string
-	Description string
-	Parameters  []Parameter
-	Execute     func(context.Context, json.RawMessage) (string, error)
+	bindEnvironment func(*AgentEnvironment, string, []Tool) Tool
+	Name            string
+	Description     string
+	Parameters      []Parameter
+	Execute         func(context.Context, json.RawMessage) (string, error)
 }
 
 type ToolSummary struct {
@@ -42,10 +45,14 @@ func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {
 	required := []string{}
 
 	for _, p := range t.Parameters {
-		properties[p.Name] = map[string]any{
+		property := map[string]any{
 			"type":        string(p.Type),
 			"description": p.Description,
 		}
+		if p.Type == Array {
+			property["items"] = map[string]any{"type": string(p.Items)}
+		}
+		properties[p.Name] = property
 		if p.Required {
 			required = append(required, p.Name)
 		}

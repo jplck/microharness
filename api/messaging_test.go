@@ -5,6 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -42,6 +45,57 @@ func waitForInbox(t *testing.T, env *AgentEnvironment, name string, ready func([
 		case <-deadline.C:
 			t.Fatalf("inbox condition not met for %q", name)
 		}
+	}
+}
+
+func TestAgentCreatesAndMessagesChild(t *testing.T) {
+	ctx, root, _ := setupPersistenceTest(t)
+	called := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		called <- struct{}{}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"id":"child-response","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"Task completed"}}]}`)
+	}))
+	defer server.Close()
+	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI, Endpoint: server.URL}}}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := NewAgentEnvironment(ctx, root, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer env.Close()
+	parent, err := env.CreateAgent(ctx, "test-model", []Tool{CreateAgentTool()}, "parent", "Delegate tasks", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent.Client = messageTestModel{call: func(ctx context.Context, messages []Message) (Message, error) {
+		if messages[len(messages)-1].Role == "user" {
+			return Message{Role: "assistant", ToolCalls: []ToolCall{
+				{ID: "create-child", Name: "create_agent", Arguments: json.RawMessage(`{"name":"child","model":"test-model","instructions":"Complete assigned tasks"}`)},
+				{ID: "delegate", Name: "message", Arguments: json.RawMessage(`{"to":"child","content":"Complete this task"}`)},
+			}}, nil
+		}
+		return Message{Role: "assistant", Content: "Delegated"}, nil
+	}}
+	if err := env.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := env.Message(ctx, Envelope{Sender: "user", To: "parent", Content: "Create a helper and delegate", ConversationID: "task-1"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-called:
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool-created child did not process delegated work")
+	}
+	for _, name := range []string{"parent", "child"} {
+		waitForInbox(t, env, name, func(inbox []Envelope, failure string) bool { return len(inbox) == 0 && failure == "" })
+	}
+	env.Close()
+	child := env.agentLocked("child")
+	if child == nil || len(child.ToolNames) != 0 || child.Session.Messages[len(child.Session.Messages)-1].Content != "Task completed" {
+		t.Fatal("child did not complete and persist its task")
 	}
 }
 

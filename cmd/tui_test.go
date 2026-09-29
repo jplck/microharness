@@ -56,6 +56,9 @@ func TestTUICreateAgentAndMessage(t *testing.T) {
 			if r.URL.Query().Get("tool") != "get_time" {
 				t.Error("selected tool was not sent")
 			}
+			if r.URL.Query().Get("assignable_tool") != "get_time" {
+				t.Error("assign permission not sent")
+			}
 			w.WriteHeader(http.StatusCreated)
 		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/messages"):
 			if err := json.NewDecoder(r.Body).Decode(&sent); err != nil {
@@ -88,6 +91,8 @@ func TestTUICreateAgentAndMessage(t *testing.T) {
 	model.text.SetValue(wantInstructions)
 	model.Update(tea.KeyMsg{Type: tea.KeyTab})
 	model.Update(tuiKey(" "))
+	model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model.Update(tuiKey(" "))
 	_, command = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	if !model.busy || command == nil {
 		t.Fatal("submission did not start")
@@ -117,6 +122,7 @@ func TestTUIEditAgent(t *testing.T) {
 		t.Fatal(err)
 	}
 	var submitted []string
+	var submittedAssignable []string
 	var submittedModel, submittedInstructions string
 	puts := 0
 	reject := true
@@ -125,7 +131,7 @@ func TestTUIEditAgent(t *testing.T) {
 		case "GET /tools":
 			io.WriteString(w, `[{"name":"first","description":"First tool"},{"name":"second","description":"Second tool"},{"name":"third","description":"Third tool"}]`)
 		case "GET /environments/team/agents":
-			json.NewEncoder(w).Encode([]api.AgentSummary{{Name: "worker", Model: submittedModel, Instructions: submittedInstructions, Tools: submitted}})
+			json.NewEncoder(w).Encode([]api.AgentSummary{{Name: "worker", Model: submittedModel, Instructions: submittedInstructions, Tools: submitted, AssignableTools: submittedAssignable}})
 		case "PUT /environments/team/agents/worker":
 			puts++
 			if reject {
@@ -133,6 +139,7 @@ func TestTUIEditAgent(t *testing.T) {
 				return
 			}
 			submitted = append([]string{}, r.URL.Query()["tool"]...)
+			submittedAssignable = append([]string{}, r.URL.Query()["assignable_tool"]...)
 			submittedModel, submittedInstructions = r.URL.Query().Get("model"), r.URL.Query().Get("instructions")
 			w.WriteHeader(http.StatusNoContent)
 		default:
@@ -141,12 +148,15 @@ func TestTUIEditAgent(t *testing.T) {
 	})
 	model := newTUI(t.Context(), client)
 	model.page, model.environment, model.busy = "agents", "team", false
-	model.agents = []api.AgentSummary{{Name: "worker", Model: "second", Instructions: "Original", Tools: []string{"first"}}}
+	model.agents = []api.AgentSummary{{Name: "worker", Model: "second", Instructions: "Original", Tools: []string{"first"}, AssignableTools: []string{"third"}}}
 	_, load := model.Update(tuiKey("e"))
 	if load == nil {
 		t.Fatal("edit form did not load")
 	}
 	model.Update(load())
+	if !model.assignableTools["third"] || model.selectedTools["third"] {
+		t.Fatal("assign-only permission was not prefilled independently")
+	}
 	if model.form != "agent" || model.editingAgent != "worker" || model.inputs[0].Value() != "worker" || model.inputs[1].Value() != "second" || model.text.Value() != "Original" || !model.selectedTools["first"] {
 		t.Fatal("shared agent form was not prefilled")
 	}
@@ -162,8 +172,14 @@ func TestTUIEditAgent(t *testing.T) {
 	model.Update(tuiKey(" "))
 	model.Update(tea.KeyMsg{Type: tea.KeyDown})
 	model.Update(tuiKey(" "))
+	model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	model.Update(tuiKey(" "))
 	_, save := model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model.Update(save())
+	if !model.assignableTools["first"] || !model.assignableTools["third"] {
+		t.Fatal("failed save lost grant selections")
+	}
 	if !model.failed || model.form != "agent" || !model.selectedTools["second"] || !strings.HasPrefix(model.text.Value(), "Updated instructions") {
 		t.Fatal("save failure lost selection")
 	}
@@ -177,17 +193,29 @@ func TestTUIEditAgent(t *testing.T) {
 	if submittedModel != "first" || submittedInstructions != "Updated instructions\nKeep sources & caveats." {
 		t.Fatal("agent settings not saved")
 	}
+	if strings.Join(submittedAssignable, ",") != "first,third" {
+		t.Fatal("assign permissions did not save independently")
+	}
 	_, load = model.Update(tuiKey("e"))
 	model.Update(load())
+	if !model.assignableTools["third"] || model.selectedTools["third"] {
+		t.Fatal("saved assign-only tool not restored")
+	}
 	for range 3 {
 		model.Update(tea.KeyMsg{Type: tea.KeyTab})
 	}
 	model.Update(tea.KeyMsg{Type: tea.KeyDown})
 	model.Update(tuiKey(" "))
+	model.Update(tea.KeyMsg{Type: tea.KeyRight})
+	model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	model.Update(tuiKey(" "))
+	model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	model.Update(tea.KeyMsg{Type: tea.KeyUp})
+	model.Update(tuiKey(" "))
 	_, save = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	_, reload = model.Update(save())
 	model.Update(reload())
-	if submitted == nil || len(submitted) != 0 {
+	if submitted == nil || len(submitted) != 0 || len(submittedAssignable) != 0 {
 		t.Fatal("clearing tools did not send an empty array")
 	}
 	_, load = model.Update(tuiKey("e"))
@@ -195,6 +223,8 @@ func TestTUIEditAgent(t *testing.T) {
 	for range 3 {
 		model.Update(tea.KeyMsg{Type: tea.KeyTab})
 	}
+	model.Update(tuiKey(" "))
+	model.Update(tea.KeyMsg{Type: tea.KeyRight})
 	model.Update(tuiKey(" "))
 	model.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	if puts != 3 || model.form != "" {
@@ -230,7 +260,9 @@ func TestTUIToolPickerBoundsAndEmptyCatalog(t *testing.T) {
 			model.Update(tea.KeyMsg{Type: tea.KeyTab})
 		}
 		model.Update(tuiKey(" "))
-		if len(model.toolSelection()) != 0 {
+		model.Update(tea.KeyMsg{Type: tea.KeyRight})
+		model.Update(tuiKey(" "))
+		if len(selectedToolNames(model.selectedTools)) != 0 || len(selectedToolNames(model.assignableTools)) != 0 {
 			t.Fatal("empty catalog selected a tool")
 		}
 		for range 20 {

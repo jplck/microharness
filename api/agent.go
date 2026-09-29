@@ -25,22 +25,28 @@ type Envelope struct {
 }
 
 type Agent struct {
-	runMu        sync.Mutex
-	inboxWake    chan struct{}
-	Client       ModelCall
-	Tools        []Tool
-	ToolNames    []string
-	ModelName    string
-	Name         string
-	Instructions string
-	Session      Session
-	Inbox        []Envelope
-	InboxError   string
+	runMu               sync.Mutex
+	inboxWake           chan struct{}
+	Client              ModelCall
+	Tools               []Tool
+	ToolNames           []string
+	AssignableTools     []Tool
+	AssignableToolNames []string
+	ModelName           string
+	Name                string
+	Instructions        string
+	Session             Session
+	Inbox               []Envelope
+	InboxError          string
 }
 
-func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, initial bool) (*Agent, error) {
+func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, initial bool, assignableTools ...Tool) (*Agent, error) {
 	env.mu.Lock()
 	defer env.mu.Unlock()
+	return env.createAgentLocked(ctx, modelName, tools, name, instructions, initial, assignableTools...)
+}
+
+func (env *AgentEnvironment) createAgentLocked(ctx context.Context, modelName string, tools []Tool, name string, instructions string, initial bool, assignableTools ...Tool) (*Agent, error) {
 	if env.closed {
 		return nil, ErrEnvironmentClosed
 	}
@@ -55,7 +61,7 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, 
 			return nil, fmt.Errorf("%w: %q", ErrAgentExists, name)
 		}
 	}
-	agent, err := env.createAgent(ctx, modelName, tools, name, instructions, "")
+	agent, err := env.createAgent(ctx, modelName, tools, name, instructions, "", assignableTools...)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +81,7 @@ func (env *AgentEnvironment) CreateAgent(ctx context.Context, modelName string, 
 	return agent, nil
 }
 
-func (env *AgentEnvironment) agentTools(ctx context.Context, name string, tools []Tool) ([]Tool, []string, error) {
+func (env *AgentEnvironment) agentTools(ctx context.Context, name string, tools []Tool, assignableTools ...Tool) ([]Tool, []string, error) {
 	builtins := MemoryTools(ctx, env.MemoryStore)
 	builtins = append(builtins, env.messagingTools(name)...)
 	toolNames := make([]string, 0, len(tools))
@@ -84,13 +90,17 @@ func (env *AgentEnvironment) agentTools(ctx context.Context, name string, tools 
 		seen[tool.Name] = true
 	}
 	for _, tool := range tools {
+		if tool.bindEnvironment != nil {
+			tool = tool.bindEnvironment(env, name, assignableTools)
+		}
 		if tool.Name == "" || tool.Execute == nil || seen[tool.Name] {
 			return nil, nil, fmt.Errorf("%w %q", ErrInvalidTool, tool.Name)
 		}
 		seen[tool.Name] = true
 		toolNames = append(toolNames, tool.Name)
+		builtins = append(builtins, tool)
 	}
-	return append(builtins, tools...), toolNames, nil
+	return builtins, toolNames, nil
 }
 
 func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, tools []Tool) error {
@@ -115,7 +125,7 @@ func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, too
 	if len(agent.Inbox) > 0 {
 		return ErrAgentBusy
 	}
-	resolved, names, err := env.agentTools(ctx, name, tools)
+	resolved, names, err := env.agentTools(ctx, name, tools, agent.AssignableTools...)
 	if err != nil {
 		return err
 	}
@@ -128,7 +138,7 @@ func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, too
 	return nil
 }
 
-func (env *AgentEnvironment) UpdateAgent(ctx context.Context, name, modelName, instructions string, tools []Tool) error {
+func (env *AgentEnvironment) UpdateAgent(ctx context.Context, name, modelName, instructions string, tools []Tool, assignableTools ...Tool) error {
 	env.mu.Lock()
 	agent := env.agentLocked(name)
 	env.mu.Unlock()
@@ -158,11 +168,15 @@ func (env *AgentEnvironment) UpdateAgent(ctx context.Context, name, modelName, i
 	if err != nil {
 		return err
 	}
-	resolved, names, err := env.agentTools(ctx, name, tools)
+	resolved, names, err := env.agentTools(ctx, name, tools, assignableTools...)
 	if err != nil {
 		return err
 	}
 	previousSession := agent.Session
+	_, assignableNames, err := env.agentTools(ctx, name, assignableTools)
+	if err != nil {
+		return err
+	}
 	updatedSession := previousSession
 	sessionChanged := setSessionInstructions(&updatedSession, instructions)
 	if sessionChanged {
@@ -172,10 +186,13 @@ func (env *AgentEnvironment) UpdateAgent(ctx context.Context, name, modelName, i
 	}
 	previousModel, previousInstructions, previousClient := agent.ModelName, agent.Instructions, agent.Client
 	previousTools, previousNames := agent.Tools, agent.ToolNames
+	previousAssignable, previousAssignableNames := agent.AssignableTools, agent.AssignableToolNames
+	agent.AssignableTools, agent.AssignableToolNames = append([]Tool(nil), assignableTools...), assignableNames
 	agent.ModelName, agent.Instructions, agent.Client = modelName, instructions, client
 	agent.Tools, agent.ToolNames, agent.Session = resolved, names, updatedSession
 	if err := env.saveLocked(); err != nil {
 		agent.ModelName, agent.Instructions, agent.Client = previousModel, previousInstructions, previousClient
+		agent.AssignableTools, agent.AssignableToolNames = previousAssignable, previousAssignableNames
 		agent.Tools, agent.ToolNames, agent.Session = previousTools, previousNames, previousSession
 		if sessionChanged {
 			err = errors.Join(err, previousSession.persist())
@@ -217,7 +234,7 @@ func setSessionInstructions(session *Session, instructions string) bool {
 	return true
 }
 
-func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, sessionID string) (*Agent, error) {
+func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, tools []Tool, name string, instructions string, sessionID string, assignableTools ...Tool) (*Agent, error) {
 	config, err := GetModelByName(modelName)
 	if err != nil {
 		return nil, err
@@ -226,12 +243,16 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 	if err != nil {
 		return nil, err
 	}
-	tools, toolNames, err := env.agentTools(ctx, name, tools)
+	tools, toolNames, err := env.agentTools(ctx, name, tools, assignableTools...)
 	if err != nil {
 		return nil, err
 	}
 
 	session := Session{SessionID: sessionID, Scope: filepath.Join(env.DataRoot, "Sessions")}
+	_, assignableNames, err := env.agentTools(ctx, name, assignableTools)
+	if err != nil {
+		return nil, err
+	}
 
 	if sessionID == "" {
 		session.SessionID = rand.Text()
@@ -247,13 +268,15 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 	}
 
 	agent := &Agent{
-		Client:       client,
-		Tools:        tools,
-		ToolNames:    toolNames,
-		ModelName:    modelName,
-		Name:         name,
-		Instructions: instructions,
-		Session:      session,
+		Client:              client,
+		Tools:               tools,
+		ToolNames:           toolNames,
+		AssignableTools:     append([]Tool(nil), assignableTools...),
+		AssignableToolNames: assignableNames,
+		ModelName:           modelName,
+		Name:                name,
+		Instructions:        instructions,
+		Session:             session,
 	}
 
 	return agent, nil

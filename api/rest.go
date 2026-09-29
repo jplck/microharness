@@ -19,6 +19,7 @@ import (
 func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	var mu sync.Mutex
 	registry := BuiltinTools()
+	registry["create_agent"] = CreateAgentTool()
 	environments, err := loadAgentEnvironments(ctx, dataRoot, registry)
 	if err != nil {
 		return err
@@ -55,7 +56,8 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			agents = append(agents, AgentSummary{
 				Name: agent.Name, Model: agent.ModelName, Instructions: agent.Instructions,
 				Pending: len(agent.Inbox), Error: agent.InboxError,
-				Tools: append([]string{}, agent.ToolNames...),
+				Tools:           append([]string{}, agent.ToolNames...),
+				AssignableTools: append([]string{}, agent.AssignableToolNames...),
 			})
 		}
 		env.mu.Unlock()
@@ -124,10 +126,15 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 				writeMessagingError(w, err)
 				return
 			}
+			assignableTools, err := resolveTools(registry, r.URL.Query()["assignable_tool"])
+			if err != nil {
+				writeMessagingError(w, err)
+				return
+			}
 			if r.Method == http.MethodPut {
-				err = env.UpdateAgent(r.Context(), name, r.URL.Query().Get("model"), r.URL.Query().Get("instructions"), tools)
+				err = env.UpdateAgent(r.Context(), name, r.URL.Query().Get("model"), r.URL.Query().Get("instructions"), tools, assignableTools...)
 			} else {
-				_, err = env.CreateAgent(ctx, r.URL.Query().Get("model"), tools, name, r.URL.Query().Get("instructions"), false)
+				_, err = env.CreateAgent(ctx, r.URL.Query().Get("model"), tools, name, r.URL.Query().Get("instructions"), false, assignableTools...)
 			}
 			if err != nil {
 				writeMessagingError(w, err)
@@ -250,12 +257,13 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 }
 
 type AgentSummary struct {
-	Name         string   `json:"name"`
-	Model        string   `json:"model"`
-	Instructions string   `json:"instructions"`
-	Pending      int      `json:"pending"`
-	Error        string   `json:"error,omitempty"`
-	Tools        []string `json:"tools"`
+	AssignableTools []string `json:"assignable_tools"`
+	Name            string   `json:"name"`
+	Model           string   `json:"model"`
+	Instructions    string   `json:"instructions"`
+	Pending         int      `json:"pending"`
+	Error           string   `json:"error,omitempty"`
+	Tools           []string `json:"tools"`
 }
 
 func resolveTools(registry ToolRegistry, names []string) ([]Tool, error) {
