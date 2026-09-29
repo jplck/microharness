@@ -95,6 +95,48 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 	instructions := "Research technical questions & report findings.\nInclude sources + note uncertainty?"
 	query := url.Values{"model": []string{"test-model"}, "instructions": []string{instructions}}
 	post("/environments/test/agents/assistant?"+query.Encode(), http.StatusCreated)
+	agentResponse, err := client.Get("http://localhost/environments/test/agents")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var agents []AgentSummary
+	err = json.NewDecoder(agentResponse.Body).Decode(&agents)
+	agentResponse.Body.Close()
+	if err != nil || agentResponse.StatusCode != http.StatusOK || len(agents) != 1 ||
+		agents[0].Name != "assistant" || agents[0].Model != "test-model" || agents[0].Instructions != instructions {
+		t.Fatalf("agent listing: %+v, %v", agents, err)
+	}
+	for _, path := range []string{"/environments/missing/agents/assistant/session", "/environments/test/agents/missing/session"} {
+		response, err := client.Get("http://localhost" + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("GET %s: got %s", path, response.Status)
+		}
+	}
+	for _, content := range []string{"First completed response", "Second completed response"} {
+		if err := cli.InitialAgent.Session.AddMessage(Message{Role: "assistant", Content: content}); err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Get("http://localhost/environments/cli-environment/agents/cli-agent/session")
+		if err != nil {
+			t.Fatal(err)
+		}
+		var snapshot Session
+		err = json.NewDecoder(response.Body).Decode(&snapshot)
+		response.Body.Close()
+		if err != nil || response.StatusCode != http.StatusOK || len(snapshot.Messages) == 0 {
+			t.Fatalf("session snapshot: %s, %v", response.Status, err)
+		}
+		if snapshot.Messages[len(snapshot.Messages)-1].Content != content {
+			t.Fatal("session endpoint did not read the latest committed message")
+		}
+		if snapshot.Scope != "" || snapshot.SessionID != "" {
+			t.Fatal("session endpoint exposed internal storage paths")
+		}
+	}
 	stop()
 	loaded, err := LoadAgentEnvironment(ctx, root, "test", registry)
 	if err != nil {
@@ -144,10 +186,81 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 	}
 }
 
+func TestRuntimeToolSelection(t *testing.T) {
+	ctx, root, _ := setupPersistenceTest(t)
+	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI}, {Name: "other-model", Provider: ProviderOpenAI}}}); err != nil {
+		t.Fatal(err)
+	}
+	client, stop := startTestRuntime(t, root)
+	request := func(method, path, body string, status int) []byte {
+		t.Helper()
+		req, err := http.NewRequest(method, "http://localhost"+path, strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		data, err := io.ReadAll(response.Body)
+		if err != nil || response.StatusCode != status {
+			t.Fatalf("%s %s: %s %s %v", method, path, response.Status, data, err)
+		}
+		return data
+	}
+	var catalog []ToolSummary
+	if err := json.Unmarshal(request("GET", "/tools", "", 200), &catalog); err != nil || len(catalog) != 1 || catalog[0].Name != "get_time" {
+		t.Fatalf("tool catalog: %+v %v", catalog, err)
+	}
+	request("POST", "/environments/tools", "", 201)
+	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message"} {
+		request("POST", "/environments/tools/agents/assistant?model=test-model&"+query, "", 400)
+	}
+	request("POST", "/environments/tools/agents/assistant?model=test-model&tool=get_time", "", 201)
+	var agents []AgentSummary
+	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || len(agents) != 1 || !reflect.DeepEqual(agents[0].Tools, []string{"get_time"}) {
+		t.Fatalf("agent tools: %+v %v", agents, err)
+	}
+	for _, body := range []string{`["missing"]`, `["get_time","get_time"]`, `null`, `{}`, `[] []`} {
+		request("PUT", "/environments/tools/agents/assistant/tools", body, 400)
+	}
+	request("PUT", "/environments/tools/agents/missing/tools", `[]`, 404)
+	request("PUT", "/environments/tools/agents/assistant/tools", `[]`, 204)
+	request("PUT", "/environments/tools/agents/assistant/tools", `["get_time"]`, 204)
+	instructions := "Updated instructions\nKeep sources & caveats."
+	update := "/environments/tools/agents/assistant?" + url.Values{"model": {"other-model"}, "instructions": {instructions}, "tool": {"get_time"}}.Encode()
+	request("PUT", update, "", 204)
+	for _, query := range []string{"model=missing", "model=test-model&tool=missing", "model=test-model&tool=get_time&tool=get_time"} {
+		request("PUT", "/environments/tools/agents/assistant?"+query, "", 400)
+	}
+	request("PUT", "/environments/tools/agents/missing?model=test-model", "", 404)
+	if err := json.Unmarshal(request("GET", "/environments/tools/agents", "", 200), &agents); err != nil || agents[0].Model != "other-model" || agents[0].Instructions != instructions || !reflect.DeepEqual(agents[0].Tools, []string{"get_time"}) {
+		t.Fatalf("updated agent settings: %+v %v", agents, err)
+	}
+	var session Session
+	if err := json.Unmarshal(request("GET", "/environments/tools/agents/assistant/session", "", 200), &session); err != nil || len(session.Messages) == 0 || session.Messages[0].Content != agentInstructions(instructions) {
+		t.Fatalf("updated session instructions: %+v %v", session, err)
+	}
+	stop()
+	loaded, err := LoadAgentEnvironment(ctx, root, "tools", BuiltinTools())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.Agents[0].ToolNames, []string{"get_time"}) {
+		t.Fatal("tool edit did not survive restart")
+	}
+	if loaded.Agents[0].ModelName != "other-model" || loaded.Agents[0].Instructions != instructions || loaded.Agents[0].Session.Messages[0].Content != agentInstructions(instructions) {
+		t.Fatal("agent edit did not survive restart")
+	}
+}
+
 func TestRuntimeMessagingAPI(t *testing.T) {
 	ctx, root, registry := setupPersistenceTest(t)
 	var available atomic.Bool
 	var calls atomic.Int32
+	modelStarted := make(chan struct{}, 2)
+	releaseModel := make(chan struct{})
 	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
@@ -156,9 +269,18 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 			io.WriteString(w, `{"error":{"message":"model unavailable","type":"invalid_request_error"}}`)
 			return
 		}
+		modelStarted <- struct{}{}
+		<-releaseModel
 		io.WriteString(w, `{"id":"reply","object":"chat.completion","choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"Completed"}}]}`)
 	}))
 	defer modelServer.Close()
+	defer func() {
+		select {
+		case <-releaseModel:
+		default:
+			close(releaseModel)
+		}
+	}()
 	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI, Endpoint: modelServer.URL}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -238,6 +360,20 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	request(http.MethodPost, "/environments/mail/messages", `{"Sender":"user","To":"recipient","Content":"Second job"}`, http.StatusAccepted)
 	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 2 && inbox.Error != "" })
 	request(http.MethodPost, "/environments/mail/agents/recipient/inbox/retry", "", http.StatusAccepted)
+	select {
+	case <-modelStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("model did not start processing")
+	}
+	data = request(http.MethodGet, "/environments/mail/agents/recipient/session", "", http.StatusOK)
+	var snapshot Session
+	if err := json.Unmarshal(data, &snapshot); err != nil || len(snapshot.Messages) == 0 {
+		t.Fatalf("cannot read session during an active turn: %v", err)
+	}
+	if snapshot.Messages[len(snapshot.Messages)-1].EnvelopeID != receipt["id"] {
+		t.Fatal("active session snapshot is missing the in-progress envelope")
+	}
+	close(releaseModel)
 	waitInbox(func(inbox InboxState) bool { return len(inbox.Messages) == 0 && inbox.Error == "" })
 	stop()
 	loaded, err := LoadAgentEnvironment(ctx, root, "mail", registry)

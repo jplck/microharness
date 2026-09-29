@@ -18,11 +18,24 @@ import (
 
 func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	var mu sync.Mutex
-	environments, err := loadAgentEnvironments(ctx, dataRoot, BuiltinTools())
+	registry := BuiltinTools()
+	environments, err := loadAgentEnvironments(ctx, dataRoot, registry)
 	if err != nil {
 		return err
 	}
 	mux := http.NewServeMux()
+	mux.HandleFunc("GET /tools", func(w http.ResponseWriter, r *http.Request) {
+		names := make([]string, 0, len(registry))
+		for name := range registry {
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		tools := make([]ToolSummary, 0, len(names))
+		for _, name := range names {
+			tools = append(tools, ToolSummary{Name: name, Description: registry[name].Description})
+		}
+		writeJSONResponse(w, http.StatusOK, tools)
+	})
 	handleEnvironment := func(pattern string, handler func(http.ResponseWriter, *http.Request, *AgentEnvironment)) {
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 			mu.Lock()
@@ -35,6 +48,19 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			handler(w, r, env)
 		})
 	}
+	handleEnvironment("GET /environments/{id}/agents", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		env.mu.Lock()
+		agents := make([]AgentSummary, 0, len(env.Agents))
+		for _, agent := range env.Agents {
+			agents = append(agents, AgentSummary{
+				Name: agent.Name, Model: agent.ModelName, Instructions: agent.Instructions,
+				Pending: len(agent.Inbox), Error: agent.InboxError,
+				Tools: append([]string{}, agent.ToolNames...),
+			})
+		}
+		env.mu.Unlock()
+		writeJSONResponse(w, http.StatusOK, agents)
+	})
 	handleEnvironment("POST /environments/{id}/messages", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 		decoder.DisallowUnknownFields()
@@ -66,6 +92,23 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		}
 		writeJSONResponse(w, http.StatusOK, inbox)
 	})
+	handleEnvironment("GET /environments/{id}/agents/{name}/session", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		env.mu.Lock()
+		agent := env.agentLocked(r.PathValue("name"))
+		if agent == nil {
+			env.mu.Unlock()
+			writeMessagingError(w, ErrAgentNotFound)
+			return
+		}
+		snapshot := Session{SessionID: agent.Session.SessionID, Scope: agent.Session.Scope}
+		env.mu.Unlock()
+		if err := snapshot.Load(); err != nil {
+			log.Printf("session snapshot failed: %v", err)
+			http.Error(w, "cannot read session", http.StatusInternalServerError)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, snapshot)
+	})
 	handleEnvironment("POST /environments/{id}/agents/{name}/inbox/retry", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		if err := env.RetryInbox(r.Context(), r.PathValue("name")); err != nil {
 			writeMessagingError(w, err)
@@ -73,14 +116,51 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
-	handleEnvironment("POST /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
-		name := r.PathValue("name")
-		if _, err := env.CreateAgent(ctx, r.URL.Query().Get("model"), nil, name, r.URL.Query().Get("instructions"), false); err != nil {
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		handleEnvironment(method+" /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+			name := r.PathValue("name")
+			tools, err := resolveTools(registry, r.URL.Query()["tool"])
+			if err != nil {
+				writeMessagingError(w, err)
+				return
+			}
+			if r.Method == http.MethodPut {
+				err = env.UpdateAgent(r.Context(), name, r.URL.Query().Get("model"), r.URL.Query().Get("instructions"), tools)
+			} else {
+				_, err = env.CreateAgent(ctx, r.URL.Query().Get("model"), tools, name, r.URL.Query().Get("instructions"), false)
+			}
+			if err != nil {
+				writeMessagingError(w, err)
+				return
+			}
+			if r.Method == http.MethodPut {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			log.Printf("agent created: environment=%s name=%s", r.PathValue("id"), name)
+			w.WriteHeader(http.StatusCreated)
+		})
+	}
+	handleEnvironment("PUT /environments/{id}/agents/{name}/tools", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		var names []string
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+		if err := decoder.Decode(&names); err != nil || names == nil {
+			http.Error(w, "expected a JSON array of tool names", http.StatusBadRequest)
+			return
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			http.Error(w, "expected one JSON array", http.StatusBadRequest)
+			return
+		}
+		tools, err := resolveTools(registry, names)
+		if err == nil {
+			err = env.SetAgentTools(r.Context(), r.PathValue("name"), tools)
+		}
+		if err != nil {
 			writeMessagingError(w, err)
 			return
 		}
-		log.Printf("agent created: environment=%s name=%s", r.PathValue("id"), name)
-		w.WriteHeader(http.StatusCreated)
+		w.WriteHeader(http.StatusNoContent)
 	})
 	mux.HandleFunc("POST /environments/{id}", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")
@@ -169,6 +249,27 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	return err
 }
 
+type AgentSummary struct {
+	Name         string   `json:"name"`
+	Model        string   `json:"model"`
+	Instructions string   `json:"instructions"`
+	Pending      int      `json:"pending"`
+	Error        string   `json:"error,omitempty"`
+	Tools        []string `json:"tools"`
+}
+
+func resolveTools(registry ToolRegistry, names []string) ([]Tool, error) {
+	tools := make([]Tool, 0, len(names))
+	for _, name := range names {
+		tool, ok := registry[name]
+		if !ok {
+			return nil, fmt.Errorf("%w %q", ErrInvalidTool, name)
+		}
+		tools = append(tools, tool)
+	}
+	return tools, nil
+}
+
 func writeJSONResponse(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -181,9 +282,9 @@ func writeMessagingError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrAgentNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
-	case errors.Is(err, ErrAgentExists):
+	case errors.Is(err, ErrAgentExists), errors.Is(err, ErrAgentBusy):
 		http.Error(w, err.Error(), http.StatusConflict)
-	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound):
+	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound), errors.Is(err, ErrInvalidTool):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, ErrEnvironmentClosed), errors.Is(err, context.Canceled):
 		http.Error(w, "environment is stopping", http.StatusServiceUnavailable)

@@ -32,6 +32,11 @@ type Tool struct {
 	Execute     func(context.Context, json.RawMessage) (string, error)
 }
 
+type ToolSummary struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
 func (t Tool) AsOpenAITool() openai.ChatCompletionToolUnionParam {
 	properties := make(map[string]any, len(t.Parameters))
 	required := []string{}

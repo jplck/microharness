@@ -1,5 +1,55 @@
 # Micro
 
+## Terminal interface
+
+Start the runtime in one terminal:
+
+```sh
+go run main.go serve
+```
+
+Then open the Bubble Tea interface in another terminal, from the directory
+containing your `models.json`:
+
+```sh
+go run main.go
+```
+
+`go run main.go tui` opens the same interface. The TUI connects to the runtime;
+it does not start a second runtime or process agent work itself. For a custom
+socket, pass `--socket /path/to/micro.sock` to both commands.
+
+- Use arrows to select an environment or agent and Enter to open it.
+- Press `n` to create an environment or agent. Agent creation includes a model
+  selector, optional multiline instructions, and a tool checklist.
+- Press `e` on the agent list to edit its model, instructions, and tools using
+  the same form as creation, prefilled with its current settings.
+  In the tools field, Up/Down selects a tool and Space toggles its checkbox;
+  Ctrl+S saves and Esc cancels. Tool descriptions appear below the checklist.
+  Memory and messaging tools are always enabled. Optional choices come from
+  the running server's registry; clearing all choices keeps the automatic tools.
+  Changes are persisted and require an idle agent with an empty inbox, including
+  no paused work. The name is fixed and session history is preserved; editing
+  instructions updates the session's system prompt.
+- Press `s` on an agent, its inbox, or its live session to compose a message, including optional
+  conversation and reply IDs.
+- Press `v` on an agent or its inbox to open its live session: messages, tool
+  calls, tool results, and completed responses. It refreshes every second and
+  follows the latest activity. Scroll up to read history; End resumes following.
+  Esc returns to the agent list and stops polling. This shows saved messages,
+  not token-by-token output while the model is generating a response.
+  Composing a message pauses polling; sending or cancelling returns to the live
+  session and resumes updates. Failed sends keep your draft for correction or retry.
+- Press `m` from a list to view configured models, `r` to refresh, and `t` in an
+  inbox to retry paused work. Inbox views show pending messages, not completed
+  session output. Lists and inboxes are refreshed manually.
+- In forms, Tab/Shift+Tab changes fields, Left/Right selects a model, Ctrl+S
+  submits, and Esc cancels. Outside forms, Esc goes back and `q` quits.
+  Ctrl+C always quits the interface without stopping the runtime.
+
+The interface requires a terminal of at least 40 columns by 22 rows. All CLI
+subcommands remain available for scripts.
+
 ## Agent messaging
 
 Start the runtime, then use another terminal to create agents and send work:
@@ -65,6 +115,20 @@ to exit.
 
 The Unix-socket API exposes:
 
+- `GET /tools`: registered optional tool names and descriptions.
+- `POST /environments/{id}/agents/{name}?model=...&tool=get_time`: create an
+  agent with optional repeated `tool` query parameters and `instructions`.
+- `PUT /environments/{id}/agents/{name}?model=...&instructions=...&tool=get_time`:
+  replace model, instructions, and optional tools while preserving identity and
+  session history. Omitted instructions/tools clear those settings. Returns 204
+  on success, 400 for invalid settings, or 409 when the agent is busy.
+- `PUT /environments/{id}/agents/{name}/tools`: replace optional tool assignments
+  with a JSON array of registered names, such as `["get_time"]` or `[]`.
+  Returns 204 on success, 400 for invalid tools, or 409 when the agent is busy.
+- `GET /environments/{id}/agents`: agent names, models, custom instructions,
+  optional `tools`, pending-message counts, and any inbox error.
+- `GET /environments/{id}/agents/{name}/session`: the latest committed session
+  snapshot (`messages`), available even while the agent is processing work.
 - `POST /environments/{id}/messages`: an `Envelope` JSON object using the Go field
   names (`Source`, `Sender`, `To`, `Content`, `ConversationID`, `ReplyTo`, optional
   `ID`); returns HTTP 202 with `id` and `status`.

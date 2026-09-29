@@ -113,39 +113,52 @@ func agentPath(environment, agent string) string {
 }
 
 func runtimeRequest(cmd *cobra.Command, method, path string, body io.Reader) error {
-	transport := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
-		},
-	}
-	defer transport.CloseIdleConnections()
-	client := &http.Client{Transport: transport, Timeout: 10 * time.Second}
-	request, err := http.NewRequestWithContext(
-		cmd.Context(), method, "http://localhost"+path, body,
-	)
+	client := newRuntimeClient(socketPath)
+	defer client.CloseIdleConnections()
+	data, err := requestRuntime(cmd.Context(), client, method, path, body)
 	if err != nil {
 		return err
+	}
+	if method == http.MethodPost && len(data) == 0 {
+		cmd.Println("Request accepted.")
+		return nil
+	}
+	_, err = cmd.OutOrStdout().Write(data)
+	return err
+}
+
+func newRuntimeClient(socket string) *http.Client {
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", socket)
+		},
+	}
+	return &http.Client{Transport: transport, Timeout: 10 * time.Second}
+}
+
+func requestRuntime(ctx context.Context, client *http.Client, method, path string, body io.Reader) ([]byte, error) {
+	request, err := http.NewRequestWithContext(
+		ctx, method, "http://localhost"+path, body,
+	)
+	if err != nil {
+		return nil, err
 	}
 	if body != nil {
 		request.Header.Set("Content-Type", "application/json")
 	}
 	response, err := client.Do(request)
 	if err != nil {
-		return fmt.Errorf("contact runtime at %s: %w", socketPath, err)
+		return nil, fmt.Errorf("contact runtime (start micro serve): %w", err)
 	}
 	defer response.Body.Close()
 	if response.StatusCode >= 300 {
 		body, err := io.ReadAll(io.LimitReader(response.Body, 4096))
 		if err != nil {
-			return fmt.Errorf("runtime returned %s; read response: %w", response.Status, err)
+			return nil, fmt.Errorf("runtime returned %s; read response: %w", response.Status, err)
 		}
-		return fmt.Errorf("runtime returned %s: %s", response.Status, body)
+		return nil, fmt.Errorf("runtime returned %s: %s", response.Status, body)
 	}
-	written, err := io.Copy(cmd.OutOrStdout(), response.Body)
-	if err == nil && method == http.MethodPost && written == 0 {
-		cmd.Println("Request accepted.")
-	}
-	return err
+	return io.ReadAll(response.Body)
 }
 
 var serveCmd = &cobra.Command{

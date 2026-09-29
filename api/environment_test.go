@@ -27,6 +27,148 @@ func setupPersistenceTest(t *testing.T) (context.Context, string, ToolRegistry) 
 	return t.Context(), t.TempDir(), registry
 }
 
+func TestSetAgentTools(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	env, err := NewAgentEnvironment(ctx, root, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := env.CreateAgent(ctx, "test-model", nil, "assistant", "Keep instructions", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessionID := agent.Session.SessionID
+	if err := env.SetAgentTools(ctx, "assistant", []Tool{registry["echo"]}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadAgentEnvironment(ctx, root, "test", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(loaded.Agents[0].ToolNames, []string{"echo"}) || loaded.Agents[0].Session.SessionID != sessionID || loaded.Agents[0].Instructions != "Keep instructions" {
+		t.Fatal("tool edit lost configuration or did not persist")
+	}
+	for _, tools := range [][]Tool{{registry["echo"], registry["echo"]}, {{Name: "invalid"}}, {MemoryTools(ctx, env.MemoryStore)[0]}} {
+		if err := env.SetAgentTools(ctx, "assistant", tools); !errors.Is(err, ErrInvalidTool) {
+			t.Fatalf("invalid tools accepted: %v", err)
+		}
+	}
+	agent.runMu.Lock()
+	err = env.SetAgentTools(ctx, "assistant", nil)
+	agent.runMu.Unlock()
+	if !errors.Is(err, ErrAgentBusy) {
+		t.Fatalf("active turn not protected: %v", err)
+	}
+	agent.Inbox = []Envelope{{ID: "pending"}}
+	if err := env.SetAgentTools(ctx, "assistant", nil); !errors.Is(err, ErrAgentBusy) {
+		t.Fatalf("pending work not protected: %v", err)
+	}
+	agent.Inbox = nil
+	previousRoot := env.DataRoot
+	env.DataRoot = filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(env.DataRoot, []byte("blocked"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = env.SetAgentTools(ctx, "assistant", nil)
+	env.DataRoot = previousRoot
+	if err == nil || !reflect.DeepEqual(agent.ToolNames, []string{"echo"}) {
+		t.Fatal("failed save changed tool assignments")
+	}
+	if err := env.SetAgentTools(ctx, "assistant", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.ToolNames) != 0 || len(agent.Tools) != 5 {
+		t.Fatal("clearing optional tools removed automatic tools")
+	}
+	if err := env.SetAgentTools(ctx, "missing", nil); !errors.Is(err, ErrAgentNotFound) {
+		t.Fatal("missing agent accepted")
+	}
+}
+
+func TestUpdateAgent(t *testing.T) {
+	ctx, root, registry := setupPersistenceTest(t)
+	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI}, {Name: "other-model", Provider: ProviderOpenAI}}}); err != nil {
+		t.Fatal(err)
+	}
+	env, err := NewAgentEnvironment(ctx, root, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent, err := env.CreateAgent(ctx, "test-model", nil, "assistant", "Original", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := agent.Session.AddMessage(Message{Role: "assistant", Content: "History"}); err != nil {
+		t.Fatal(err)
+	}
+	sessionID := agent.Session.SessionID
+	if err := env.UpdateAgent(ctx, "assistant", "other-model", "Updated", []Tool{registry["echo"]}); err != nil {
+		t.Fatal(err)
+	}
+	if agent.ModelName != "other-model" || agent.Instructions != "Updated" || agent.Session.SessionID != sessionID || agent.Session.Messages[1].Content != "History" || agent.Session.Messages[0].Content != agentInstructions("Updated") || env.InitialAgent != agent {
+		t.Fatal("edit did not preserve identity/history or update settings")
+	}
+	loaded, err := LoadAgentEnvironment(ctx, root, "test", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.InitialAgent.ModelName != "other-model" || !reflect.DeepEqual(loaded.InitialAgent.Session.Messages, agent.Session.Messages) || !reflect.DeepEqual(loaded.InitialAgent.ToolNames, []string{"echo"}) {
+		t.Fatal("updated agent did not restore")
+	}
+	if err := env.UpdateAgent(ctx, "assistant", "missing", "bad", nil); !errors.Is(err, ErrModelNotFound) {
+		t.Fatal("unknown model accepted")
+	}
+	if err := env.UpdateAgent(ctx, "assistant", "test-model", "bad", []Tool{{Name: "bad"}}); !errors.Is(err, ErrInvalidTool) {
+		t.Fatal("invalid tools accepted")
+	}
+	agent.runMu.Lock()
+	err = env.UpdateAgent(ctx, "assistant", "test-model", "busy", nil)
+	agent.runMu.Unlock()
+	if !errors.Is(err, ErrAgentBusy) {
+		t.Fatal("active turn edited")
+	}
+	agent.Inbox = []Envelope{{ID: "pending"}}
+	err = env.UpdateAgent(ctx, "assistant", "test-model", "busy", nil)
+	agent.Inbox = nil
+	if !errors.Is(err, ErrAgentBusy) {
+		t.Fatal("queued turn edited")
+	}
+	previousRoot := env.DataRoot
+	env.DataRoot = filepath.Join(root, "blocked")
+	if err := os.WriteFile(env.DataRoot, []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err = env.UpdateAgent(ctx, "assistant", "test-model", "failed", nil)
+	env.DataRoot = previousRoot
+	if err == nil || agent.ModelName != "other-model" || agent.Instructions != "Updated" || agent.Session.Messages[0].Content != agentInstructions("Updated") {
+		t.Fatal("failed save changed live settings")
+	}
+	saved := Session{SessionID: sessionID, Scope: agent.Session.Scope}
+	if err := saved.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if saved.Messages[0].Content != agentInstructions("Updated") {
+		t.Fatal("failed edit did not restore session prompt")
+	}
+	setSessionInstructions(&saved, "Interrupted edit")
+	if err := saved.persist(); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = LoadAgentEnvironment(ctx, root, "test", registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.InitialAgent.Session.Messages[0].Content != agentInstructions("Updated") {
+		t.Fatal("restore did not reconcile interrupted edit with committed settings")
+	}
+	if err := env.UpdateAgent(ctx, "assistant", "test-model", "", nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(agent.ToolNames) != 0 || agent.Session.Messages[0].Content != agentInstructions("") {
+		t.Fatal("clearing instructions and tools failed")
+	}
+}
+
 func TestEnvironmentRoundTrip(t *testing.T) {
 	ctx, root, registry := setupPersistenceTest(t)
 	env, err := NewAgentEnvironment(ctx, root, "test")
