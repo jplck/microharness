@@ -81,6 +81,9 @@ func (agent *Agent) currentTools() []Tool {
 	binding := ToolContext{Environment: env, Caller: agent.Name, AssignableTools: agent.AssignableTools, AllowedModels: agent.AllowedModels}
 	tools := make([]Tool, 0, len(agent.Tools))
 	for _, tool := range agent.Tools {
+		if tool.Name == "update_tool" && !slices.Contains(agent.ToolNames, "create_tool") {
+			continue
+		}
 		if tool.bind != nil {
 			tool = tool.bind(binding)
 		}

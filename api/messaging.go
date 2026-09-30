@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"slices"
 	"strings"
 )
@@ -59,6 +60,7 @@ func (env *AgentEnvironment) Status(name string) (AgentStatus, error) {
 
 func (env *AgentEnvironment) saveFailureNotificationsLocked(agent *Agent) error {
 	previousNotified := agent.notifiedFailures
+	previousHistory := maps.Clone(env.messageHistory)
 	previousLengths := make(map[*Agent]int)
 	for _, request := range agent.Inbox {
 		if request.Source != "agent" || slices.Contains(agent.notifiedFailures, request.ID) {
@@ -75,7 +77,9 @@ func (env *AgentEnvironment) saveFailureNotificationsLocked(agent *Agent) error 
 			"event": "agent_blocked", "agent": agent.Name, "status": "paused",
 			"envelope_id": request.ID, "failed_envelope_id": agent.Inbox[0].ID, "error": agent.InboxError,
 		})
-		receiver.Inbox = append(receiver.Inbox, Envelope{ID: rand.Text(), Source: "runtime", Sender: "runtime", To: receiver.Name, ConversationID: request.ConversationID, ReplyTo: request.ID, Content: string(content)})
+		notification := Envelope{ID: rand.Text(), Source: "runtime", Sender: "runtime", To: receiver.Name, ConversationID: request.ConversationID, ReplyTo: request.ID, Content: string(content)}
+		receiver.Inbox = append(receiver.Inbox, notification)
+		env.recordMessageLocked(notification)
 		agent.notifiedFailures = append(agent.notifiedFailures, request.ID)
 	}
 	if err := env.saveLocked(); err != nil {
@@ -83,6 +87,7 @@ func (env *AgentEnvironment) saveFailureNotificationsLocked(agent *Agent) error 
 			receiver.Inbox = receiver.Inbox[:length]
 		}
 		agent.notifiedFailures = previousNotified
+		env.messageHistory = previousHistory
 		return err
 	}
 	for receiver := range previousLengths {
@@ -125,11 +130,29 @@ func (env *AgentEnvironment) Message(ctx context.Context, envelope Envelope) (st
 	if recipient == nil {
 		return "", fmt.Errorf("%w: recipient %q", ErrAgentNotFound, envelope.To)
 	}
+	if envelope.Steer != "" {
+		target, exists := env.messageHistory[envelope.Steer]
+		if !exists || target.Envelope.To != recipient.Name || target.RecipientSessionID != recipient.Session.SessionID ||
+			target.Envelope.Steer != "" || (target.Status != MessageQueued && target.Status != MessageDelivered) ||
+			!slices.ContainsFunc(recipient.Inbox, func(queued Envelope) bool { return queued.ID == envelope.Steer }) {
+			return "", ErrSteeringTarget
+		}
+		if envelope.ConversationID != "" && envelope.ConversationID != target.Envelope.ConversationID {
+			return "", fmt.Errorf("%w: steering must use the target conversation", ErrInvalidEnvelope)
+		}
+		envelope.ConversationID = target.Envelope.ConversationID
+	}
 	if envelope.ID == "" {
 		envelope.ID = rand.Text()
 	}
 	if envelope.ConversationID == "" {
 		envelope.ConversationID = envelope.ID
+	}
+	if previous, exists := env.messageHistory[envelope.ID]; exists {
+		if previous.Envelope == envelope && (envelope.Source != "agent" || env.ownsMessageLocked("agent", envelope.Sender, previous)) {
+			return envelope.ID, nil
+		}
+		return "", fmt.Errorf("%w: message ID %q already exists", ErrInvalidEnvelope, envelope.ID)
 	}
 	for _, agent := range env.Agents {
 		for _, queued := range agent.Inbox {
@@ -142,6 +165,7 @@ func (env *AgentEnvironment) Message(ctx context.Context, envelope Envelope) (st
 		}
 	}
 	recipient.Inbox = append(recipient.Inbox, envelope)
+	env.recordMessageLocked(envelope)
 	var err error
 	if recipient.InboxError != "" {
 		err = env.saveFailureNotificationsLocked(recipient)
@@ -150,6 +174,7 @@ func (env *AgentEnvironment) Message(ctx context.Context, envelope Envelope) (st
 	}
 	if err != nil {
 		recipient.Inbox = recipient.Inbox[:len(recipient.Inbox)-1]
+		delete(env.messageHistory, envelope.ID)
 		return "", err
 	}
 	env.notifyLocked(recipient)
@@ -177,6 +202,12 @@ func (env *AgentEnvironment) Start(ctx context.Context) error {
 	}
 	if env.workerCtx != nil {
 		return nil
+	}
+	if err := env.restoreMessageHistoryLocked(); err != nil {
+		return err
+	}
+	if err := env.saveLocked(); err != nil {
+		return err
 	}
 	for _, agent := range env.Agents {
 		if agent.InboxError != "" {
@@ -245,7 +276,9 @@ func (env *AgentEnvironment) runInbox(ctx context.Context, agent *Agent) {
 			}
 			if err == nil {
 				previous := agent.Inbox
-				agent.Inbox = agent.Inbox[1:]
+				agent.Inbox = slices.DeleteFunc(slices.Clone(agent.Inbox), func(queued Envelope) bool {
+					return queued.ID == envelope.ID || queued.Steer == envelope.ID
+				})
 				if err = env.saveLocked(); err != nil {
 					agent.Inbox = previous
 				}
@@ -303,9 +336,10 @@ func (env *AgentEnvironment) AgentNames() []string {
 }
 
 type MessageReceipt struct {
-	ID        string      `json:"id"`
-	Status    string      `json:"status"`
-	Recipient AgentStatus `json:"recipient"`
+	ID             string      `json:"id"`
+	Status         string      `json:"status"`
+	Recipient      AgentStatus `json:"recipient"`
+	DeliveryStatus string      `json:"delivery_status"`
 }
 
 func (env *AgentEnvironment) SendAgentMessage(ctx context.Context, caller string, envelope Envelope) (MessageReceipt, error) {
@@ -318,5 +352,9 @@ func (env *AgentEnvironment) SendAgentMessage(ctx context.Context, caller string
 		return MessageReceipt{}, err
 	}
 	status, err := env.Status(envelope.To)
-	return MessageReceipt{ID: id, Status: "accepted", Recipient: status}, err
+	if err != nil {
+		return MessageReceipt{}, err
+	}
+	delivery, err := env.Delivery(id)
+	return MessageReceipt{ID: id, Status: "accepted", Recipient: status, DeliveryStatus: delivery.Status}, err
 }

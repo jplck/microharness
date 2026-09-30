@@ -65,7 +65,7 @@ func TestToolCatalogueBinding(t *testing.T) {
 	}
 	for _, env := range []*AgentEnvironment{first, second} {
 		tools, names, err := registry.Bind(ToolContext{Environment: env, Caller: "caller"}, nil)
-		if err != nil || len(tools) != 6 || len(names) != 0 {
+		if err != nil || len(tools) != 9 || len(names) != 0 {
 			t.Fatalf("automatic binding: %v %v", names, err)
 		}
 		for _, tool := range tools {
@@ -128,7 +128,7 @@ func TestCreateAgentTool(t *testing.T) {
 		t.Fatal("creation changed initial agent or failed to add child")
 	}
 	child := env.Agents[1]
-	if child.Instructions != "Research and reply to the sender" || len(child.ToolNames) != 0 || len(child.Tools) != 6 {
+	if child.Instructions != "Research and reply to the sender" || len(child.ToolNames) != 0 || len(child.Tools) != 9 {
 		t.Fatal("child did not get requested instructions and only automatic tools")
 	}
 	for _, test := range []struct {
@@ -454,7 +454,7 @@ func TestSetAgentTools(t *testing.T) {
 	if err := env.SetAgentTools(ctx, "assistant", nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(agent.ToolNames) != 0 || len(agent.Tools) != 6 {
+	if len(agent.ToolNames) != 0 || len(agent.Tools) != 9 {
 		t.Fatal("clearing optional tools removed automatic tools")
 	}
 	if err := env.SetAgentTools(ctx, "missing", nil); !errors.Is(err, ErrAgentNotFound) {
@@ -595,7 +595,7 @@ func TestEnvironmentRoundTrip(t *testing.T) {
 	if string(gotMemories) != string(wantMemories) {
 		t.Fatal("shared memories not restored")
 	}
-	if len(restored.Tools) != 7 {
+	if len(restored.Tools) != 10 {
 		t.Fatal("tool set not restored")
 	}
 	for _, tool := range restored.Tools {

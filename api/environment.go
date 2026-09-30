@@ -9,47 +9,51 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sync"
 )
 
 var validStateName = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
 
 type AgentEnvironment struct {
-	registry     ToolRegistry
-	mu           sync.Mutex
-	workerCtx    context.Context
-	workerCancel context.CancelFunc
-	workerWG     sync.WaitGroup
-	closed       bool
-	Agents       []*Agent
-	MemoryStore  *MemoryStore
-	InitialAgent *Agent
-	DataRoot     string
-	ID           string
-	Name         string
+	registry       ToolRegistry
+	mu             sync.Mutex
+	workerCtx      context.Context
+	workerCancel   context.CancelFunc
+	workerWG       sync.WaitGroup
+	closed         bool
+	Agents         []*Agent
+	MemoryStore    *MemoryStore
+	InitialAgent   *Agent
+	DataRoot       string
+	ID             string
+	Name           string
+	messageHistory map[string]MessageDelivery
 }
 
 type EnvironmentState struct {
-	Version          int          `json:"version"`
-	ID               string       `json:"id"`
-	Name             string       `json:"name"`
-	EmbeddingModel   string       `json:"embedding_model"`
-	InitialAgentName string       `json:"initial_agent_name,omitempty"`
-	Agents           []AgentState `json:"agents"`
+	Version          int                        `json:"version"`
+	ID               string                     `json:"id"`
+	Name             string                     `json:"name"`
+	EmbeddingModel   string                     `json:"embedding_model"`
+	InitialAgentName string                     `json:"initial_agent_name,omitempty"`
+	Agents           []AgentState               `json:"agents"`
+	MessageHistory   map[string]MessageDelivery `json:"message_history,omitempty"`
 }
 
 type AgentState struct {
-	Name                string     `json:"name"`
-	ModelName           string     `json:"model_name"`
-	Instructions        string     `json:"instructions,omitempty"`
-	SessionID           string     `json:"session_id"`
-	ToolNames           []string   `json:"tools,omitempty"`
-	AssignableToolNames []string   `json:"assignable_tools,omitempty"`
-	AllowedModels       []string   `json:"allowed_models,omitempty"`
-	Plugins             []string   `json:"plugins,omitempty"`
-	Inbox               []Envelope `json:"inbox,omitempty"`
-	InboxError          string     `json:"inbox_error,omitempty"`
-	NotifiedFailures    []string   `json:"notified_failures,omitempty"`
+	Name                string              `json:"name"`
+	ModelName           string              `json:"model_name"`
+	Instructions        string              `json:"instructions,omitempty"`
+	SessionID           string              `json:"session_id"`
+	ToolNames           []string            `json:"tools,omitempty"`
+	AssignableToolNames []string            `json:"assignable_tools,omitempty"`
+	AllowedModels       []string            `json:"allowed_models,omitempty"`
+	Plugins             []string            `json:"plugins,omitempty"`
+	PluginHistory       map[string][]string `json:"plugin_history,omitempty"`
+	Inbox               []Envelope          `json:"inbox,omitempty"`
+	InboxError          string              `json:"inbox_error,omitempty"`
+	NotifiedFailures    []string            `json:"notified_failures,omitempty"`
 }
 
 func NewAgentEnvironment(ctx context.Context, dataRoot, name string) (*AgentEnvironment, error) {
@@ -105,6 +109,7 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 		Agents: make([]*Agent, 0, len(state.Agents)), MemoryStore: store,
 		registry: registry,
 		DataRoot: directory, ID: state.ID, Name: state.Name,
+		messageHistory: state.MessageHistory,
 	}
 	seen := make(map[string]bool)
 	for _, saved := range state.Agents {
@@ -136,7 +141,19 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 			if len(binary.Definitions) != 1 || binary.Definitions[0].Name != filepath.Base(path) {
 				return nil, fmt.Errorf("restore agent %q plugin: expected one tool matching the executable name", saved.Name)
 			}
-			agent.plugins = append(agent.plugins, ownedPlugin{Path: name, Binary: binary})
+			previousPaths := saved.PluginHistory[name]
+			seenPaths := map[string]bool{name: true}
+			for _, previous := range previousPaths {
+				_, previousBinary, err := privatePluginPaths(directory, previous)
+				if err != nil {
+					return nil, err
+				}
+				if seenPaths[previous] || filepath.Base(previousBinary) != binary.Definitions[0].Name {
+					return nil, fmt.Errorf("invalid saved plugin version %q", previous)
+				}
+				seenPaths[previous] = true
+			}
+			agent.plugins = append(agent.plugins, ownedPlugin{Path: name, Binary: binary, PreviousPaths: slices.Clone(previousPaths)})
 		}
 		if err := checkPrivatePluginNames(agent, env.toolRegistryLocked()); err != nil {
 			return nil, err
@@ -152,6 +169,9 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 	if state.InitialAgentName != "" && env.InitialAgent == nil {
 		return nil, fmt.Errorf("initial agent %q not found", state.InitialAgentName)
 	}
+	if err := env.restoreMessageHistoryLocked(); err != nil {
+		return nil, err
+	}
 	return env, nil
 }
 
@@ -160,14 +180,19 @@ func (env *AgentEnvironment) saveLocked() error {
 		Version: 1, ID: env.ID, Name: env.Name,
 		EmbeddingModel: env.MemoryStore.EmbeddingModel,
 		Agents:         make([]AgentState, 0, len(env.Agents)),
+		MessageHistory: env.messageHistory,
 	}
 	if env.InitialAgent != nil {
 		state.InitialAgentName = env.InitialAgent.Name
 	}
 	for _, agent := range env.Agents {
 		plugins := make([]string, 0, len(agent.plugins))
+		pluginHistory := make(map[string][]string)
 		for _, plugin := range agent.plugins {
 			plugins = append(plugins, plugin.Path)
+			if len(plugin.PreviousPaths) > 0 {
+				pluginHistory[plugin.Path] = plugin.PreviousPaths
+			}
 		}
 		state.Agents = append(state.Agents, AgentState{
 			Name: agent.Name, ModelName: agent.ModelName, Instructions: agent.Instructions,
@@ -177,6 +202,7 @@ func (env *AgentEnvironment) saveLocked() error {
 			AssignableToolNames: agent.AssignableToolNames,
 			AllowedModels:       agent.AllowedModels,
 			Plugins:             plugins,
+			PluginHistory:       pluginHistory,
 		})
 	}
 	if err := writeJSONAtomic(filepath.Join(env.DataRoot, "environment.json"), state); err != nil {

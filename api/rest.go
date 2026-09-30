@@ -76,7 +76,46 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 			writeMessagingError(w, err)
 			return
 		}
-		writeJSONResponse(w, http.StatusAccepted, map[string]string{"id": id, "status": "accepted"})
+		delivery, err := env.Delivery(id)
+		if err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		writeJSONResponse(w, http.StatusAccepted, map[string]string{"id": id, "status": "accepted", "delivery_status": delivery.Status})
+	})
+	handleEnvironment("GET /environments/{id}/messages", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		writeJSONResponse(w, http.StatusOK, env.Deliveries(r.URL.Query().Get("agent")))
+	})
+	handleEnvironment("GET /environments/{id}/messages/{message}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		delivery, err := env.Delivery(r.PathValue("message"))
+		if err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, delivery)
+	})
+	handleEnvironment("POST /environments/{id}/messages/{message}/retract", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		var owner struct{ Source, Sender string }
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&owner); err != nil {
+			http.Error(w, "expected message sender JSON", http.StatusBadRequest)
+			return
+		}
+		if err := decoder.Decode(new(any)); err != io.EOF {
+			http.Error(w, "expected one sender object", http.StatusBadRequest)
+			return
+		}
+		if owner.Source == "" || owner.Sender == "" || owner.Source == "agent" || owner.Source == "runtime" {
+			http.Error(w, "an external source and sender are required", http.StatusBadRequest)
+			return
+		}
+		delivery, err := env.RetractMessage(r.Context(), owner.Source, owner.Sender, r.PathValue("message"))
+		if err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		writeJSONResponse(w, http.StatusOK, delivery)
 	})
 	handleEnvironment("GET /environments/{id}/agents/{name}/status", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 		status, err := env.Status(r.PathValue("name"))
@@ -295,10 +334,12 @@ func writeJSONResponse(w http.ResponseWriter, status int, value any) {
 
 func writeMessagingError(w http.ResponseWriter, err error) {
 	switch {
-	case errors.Is(err, ErrAgentNotFound):
+	case errors.Is(err, ErrAgentNotFound), errors.Is(err, ErrMessageNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
-	case errors.Is(err, ErrAgentExists), errors.Is(err, ErrAgentBusy), errors.Is(err, ErrAgentRunning):
+	case errors.Is(err, ErrAgentExists), errors.Is(err, ErrAgentBusy), errors.Is(err, ErrAgentRunning), errors.Is(err, ErrMessageDelivered), errors.Is(err, ErrSteeringTarget), errors.Is(err, ErrPluginUpdateConflict):
 		http.Error(w, err.Error(), http.StatusConflict)
+	case errors.Is(err, ErrMessageOwnership):
+		http.Error(w, err.Error(), http.StatusForbidden)
 	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound), errors.Is(err, ErrModelNotAllowed), errors.Is(err, ErrInvalidTool):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, ErrEnvironmentClosed), errors.Is(err, context.Canceled):

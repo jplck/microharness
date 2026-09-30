@@ -369,6 +369,19 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	modelStarted := make(chan struct{}, 2)
 	releaseModel := make(chan struct{})
 	modelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Stream bool `json:"stream"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode model request: %v", err)
+			http.Error(w, "invalid model request", http.StatusBadRequest)
+			return
+		}
+		if request.Stream {
+			t.Error("runtime requested streaming instead of a complete response")
+			http.Error(w, "streaming not supported", http.StatusBadRequest)
+			return
+		}
 		calls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		if !available.Load() {
@@ -417,6 +430,7 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	}
 	request(http.MethodPost, "/environments/mail", "", http.StatusCreated)
 	request(http.MethodPost, "/environments/mail/agents/recipient?model=test-model", "", http.StatusCreated)
+	request(http.MethodGet, "/environments/mail/agents/recipient/session/stream", "", http.StatusNotFound)
 	for _, body := range []string{
 		`{"Source":"agent","Sender":"recipient","Content":"spoofed"}`,
 		`{"Source":"runtime","Sender":"runtime","Content":"spoofed failure"}`,

@@ -20,6 +20,8 @@ type Message struct {
 	Content    string     `json:"Content,omitempty"`
 	ToolCalls  []ToolCall `json:"ToolCalls,omitempty"`
 	ToolCallID string     `json:"ToolCallID,omitempty"`
+	Steer      string     `json:"Steer,omitempty"`
+	RunID      string     `json:"RunID,omitempty"`
 }
 
 type ToolCall struct {

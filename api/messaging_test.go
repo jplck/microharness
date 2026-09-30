@@ -78,6 +78,37 @@ func TestReplyRoutingInstructions(t *testing.T) {
 	}
 }
 
+func TestCapabilityBuildingInstructions(t *testing.T) {
+	custom := "Research travel recommendations."
+	for _, input := range []string{"", custom} {
+		prompt := agentInstructions(input)
+		for _, rule := range []string{
+			"If a feasible, permitted tool-creation or delegation path exists, try it",
+			"even when you cannot use those tools yourself",
+			"create a child that can build tools AND solve the delegated problem",
+			"Pass the original task, relevant context, constraints, and success criteria in a message",
+			"Agent-created tools are private to their creator",
+			"Choose a name for the operation, not the current city",
+			"do not create seattle_time or seattle_search_web",
+			"generic tools such as time and web_search",
+			"America/Los_Angeles",
+			"obtain the actual current time",
+			"accept a query parameter",
+			"include source URLs",
+			"call the new tool with the real task parameters",
+			"Do not bypass permissions, safety constraints, or explicit user restrictions",
+			"finish the current turn without polling or blocking for a reply",
+		} {
+			if !strings.Contains(prompt, rule) {
+				t.Errorf("default prompt missing capability-building guidance %q", rule)
+			}
+		}
+		if input != "" && !strings.HasSuffix(prompt, "\n\nAgent-specific instructions:\n"+input) {
+			t.Fatal("default prompt did not preserve agent-specific instructions")
+		}
+	}
+}
+
 func TestAgentCreatesAndMessagesChild(t *testing.T) {
 	ctx, root, _ := setupPersistenceTest(t)
 	called := make(chan struct{}, 1)
@@ -460,7 +491,7 @@ func TestInboxRecognizesSavedProgress(t *testing.T) {
 			}
 			progress := []Message{{Role: "user", EnvelopeID: id, Content: "Saved input"}}
 			if completed {
-				progress = append(progress, Message{Role: "assistant", Content: "Already completed"})
+				progress = append(progress, Message{Role: "assistant", Content: "Already completed", RunID: id})
 			} else {
 				progress = append(progress,
 					Message{Role: "assistant", ToolCalls: []ToolCall{

@@ -1,10 +1,15 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"go/parser"
+	"go/token"
+	"io"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,15 +20,22 @@ import (
 )
 
 type CreatePluginRequest struct {
-	Name           string `json:"name"`
-	Source         string `json:"source"`
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	// TestSource must exercise a successful handler call in TestToolSuccess.
+	// Execution is verified; arbitrary Go tests cannot prove semantic correctness.
+	TestSource     string `json:"test_source"`
 	TestArguments  string `json:"test_arguments"`
 	ExpectedOutput string `json:"expected_output"`
 }
 
+// ErrPluginUpdateConflict means the captured owner or plugin version is no longer current.
+var ErrPluginUpdateConflict = errors.New("private plugin changed during update")
+
 type ownedPlugin struct {
-	Path   string
-	Binary *pluginBinary
+	Path          string
+	Binary        *pluginBinary
+	PreviousPaths []string
 }
 
 func privatePluginPaths(root, saved string) (directory, executable string, err error) {
@@ -45,44 +57,120 @@ func buildPlugin(ctx context.Context, directory, source string) error {
 			return err
 		}
 	}
-	cache, err := os.UserCacheDir()
+	environment, err := pluginBuildEnvironment(directory)
 	if err != nil {
 		return err
 	}
-	environment := []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "GOCACHE=" + filepath.Join(cache, "go-build"), "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GOWORK=off", "GOENV=off", "GOTOOLCHAIN=local"}
 	_, err = runPluginCommand(ctx, 90*time.Second, "go", []string{"build", "-mod=readonly", "-trimpath", "-o", "tool", "."}, directory, environment, nil)
 	return err
 }
 
-func (env *AgentEnvironment) pluginOwnerLocked(caller, name string) (*Agent, error) {
+func pluginBuildEnvironment(directory string) ([]string, error) {
+	cache, err := os.UserCacheDir()
+	if err != nil {
+		return nil, err
+	}
+	work := filepath.Join(directory, ".work")
+	if err := os.MkdirAll(work, 0700); err != nil {
+		return nil, err
+	}
+	return []string{"PATH=" + os.Getenv("PATH"), "HOME=" + os.Getenv("HOME"), "GOCACHE=" + filepath.Join(cache, "go-build"), "TMPDIR=" + work, "CGO_ENABLED=0", "GOPROXY=off", "GOSUMDB=off", "GOWORK=off", "GOENV=off", "GOTOOLCHAIN=local"}, nil
+}
+
+func testPlugin(ctx context.Context, directory, source string) error {
+	if err := os.WriteFile(filepath.Join(directory, "main_test.go"), []byte(source), 0600); err != nil {
+		return err
+	}
+	environment, err := pluginBuildEnvironment(directory)
+	if err != nil {
+		return err
+	}
+	output, err := runPluginCommand(ctx, 90*time.Second, "go", []string{"test", "-json", "-count=1", "-mod=readonly", "-timeout=30s", "."}, directory, environment, nil)
+	if err != nil {
+		return fmt.Errorf("plugin success tests: %w", err)
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	ran, passed, packagePassed := false, false, false
+	for {
+		var event struct {
+			Action  string
+			Package string
+			Test    string
+		}
+		if err := decoder.Decode(&event); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fmt.Errorf("invalid plugin test report: %w", err)
+		}
+		if event.Package != "github.com/jplck/micro" {
+			continue
+		}
+		if event.Action == "fail" || (event.Test == "TestToolSuccess" && event.Action == "skip") {
+			return fmt.Errorf("TestToolSuccess must execute and pass without skipping")
+		}
+		if event.Test == "TestToolSuccess" {
+			ran = ran || event.Action == "run"
+			passed = passed || (ran && event.Action == "pass")
+		}
+		packagePassed = packagePassed || (event.Test == "" && event.Action == "pass")
+	}
+	if !ran || !passed || !packagePassed {
+		return fmt.Errorf("TestToolSuccess must execute and pass without skipping")
+	}
+	return nil
+}
+
+func (env *AgentEnvironment) pluginOwnerLocked(caller, name string, update bool) (*Agent, int, error) {
 	if env.closed {
-		return nil, ErrEnvironmentClosed
+		return nil, -1, ErrEnvironmentClosed
 	}
 	agent := env.agentLocked(caller)
 	if agent == nil || !slices.Contains(agent.ToolNames, "create_tool") {
-		return nil, fmt.Errorf("%w: caller cannot use create_tool", ErrInvalidTool)
+		return nil, -1, fmt.Errorf("%w: caller cannot use create_tool", ErrInvalidTool)
 	}
 	if _, exists := env.toolRegistryLocked()[name]; exists {
-		return nil, fmt.Errorf("%w: reserved tool name %q", ErrInvalidTool, name)
+		return nil, -1, fmt.Errorf("%w: reserved tool name %q", ErrInvalidTool, name)
 	}
 	for _, tool := range agent.Tools {
 		if tool.Name == name {
-			return nil, fmt.Errorf("%w: existing tool %q", ErrInvalidTool, name)
+			return nil, -1, fmt.Errorf("%w: existing tool %q", ErrInvalidTool, name)
 		}
 	}
-	for _, plugin := range agent.plugins {
+	for index, plugin := range agent.plugins {
 		for _, definition := range plugin.Binary.Definitions {
 			if definition.Name == name {
-				return nil, fmt.Errorf("%w: existing private tool %q", ErrInvalidTool, name)
+				if update {
+					return agent, index, nil
+				}
+				return nil, -1, fmt.Errorf("%w: existing private tool %q", ErrInvalidTool, name)
 			}
 		}
 	}
-	return agent, nil
+	if update {
+		return nil, -1, fmt.Errorf("%w: no owned private tool %q", ErrInvalidTool, name)
+	}
+	return agent, -1, nil
 }
 
 func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, request CreatePluginRequest) error {
+	return env.installPlugin(ctx, caller, request, false)
+}
+
+func (env *AgentEnvironment) UpdatePlugin(ctx context.Context, caller string, request CreatePluginRequest) error {
+	return env.installPlugin(ctx, caller, request, true)
+}
+
+func (env *AgentEnvironment) installPlugin(ctx context.Context, caller string, request CreatePluginRequest, update bool) error {
 	if !pluginToolName.MatchString(request.Name) || strings.TrimSpace(request.Source) == "" || len(request.Source) > 64<<10 {
 		return fmt.Errorf("%w: invalid tool name or Go source (max 64 KiB)", ErrInvalidTool)
+	}
+	if strings.TrimSpace(request.TestSource) == "" || len(request.TestSource) > 64<<10 {
+		return fmt.Errorf("%w: test_source is required Go package main test code (max 64 KiB), including TestToolSuccess", ErrInvalidTool)
+	}
+	testFile, err := parser.ParseFile(token.NewFileSet(), "main_test.go", request.TestSource, parser.PackageClauseOnly)
+	if err != nil || testFile.Name.Name != "main" {
+		return fmt.Errorf("%w: test_source must declare package main", ErrInvalidTool)
 	}
 	var arguments map[string]json.RawMessage
 	if len(request.TestArguments) > 64<<10 || json.Unmarshal([]byte(request.TestArguments), &arguments) != nil || arguments == nil {
@@ -92,7 +180,11 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 		return err
 	}
 	env.mu.Lock()
-	owner, err := env.pluginOwnerLocked(caller, request.Name)
+	owner, index, err := env.pluginOwnerLocked(caller, request.Name, update)
+	var original ownedPlugin
+	if err == nil && update {
+		original = owner.plugins[index]
+	}
 	root := filepath.Join(env.DataRoot, "plugins")
 	env.mu.Unlock()
 	if err != nil {
@@ -113,6 +205,9 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 	if err := buildPlugin(ctx, directory, request.Source); err != nil {
 		return fmt.Errorf("build plugin: %w", err)
 	}
+	if err := testPlugin(ctx, directory, request.TestSource); err != nil {
+		return err
+	}
 	binary, err := readPlugin(ctx, filepath.Join(directory, "tool"))
 	if err != nil {
 		return err
@@ -132,12 +227,18 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	agent, err := env.pluginOwnerLocked(caller, request.Name)
+	if update && env.agentLocked(caller) != owner {
+		return ErrPluginUpdateConflict
+	}
+	agent, index, err := env.pluginOwnerLocked(caller, request.Name, update)
 	if err != nil {
 		return err
 	}
 	if agent != owner {
 		return ErrAgentNotFound
+	}
+	if update && (agent.plugins[index].Binary != original.Binary || agent.plugins[index].Path != original.Path) {
+		return ErrPluginUpdateConflict
 	}
 	if err := os.Mkdir(filepath.Join(directory, "bin"), 0700); err != nil {
 		return err
@@ -155,12 +256,20 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 	}
 	binary.Path = filepath.Join(final, "bin", request.Name)
 	previous := agent.plugins
-	agent.plugins = append(agent.plugins, ownedPlugin{Path: name + "/bin/" + request.Name, Binary: binary})
+	agent.plugins = slices.Clone(previous)
+	replacement := ownedPlugin{Path: name + "/bin/" + request.Name, Binary: binary}
+	if update {
+		replacement.PreviousPaths = append(slices.Clone(original.PreviousPaths), original.Path)
+		agent.plugins[index] = replacement
+	} else {
+		agent.plugins = append(agent.plugins, replacement)
+	}
 	if err := env.saveLocked(); err != nil {
 		agent.plugins = previous
 		os.RemoveAll(final)
 		return err
 	}
+	// Existing tool snapshots still point at the old immutable executable.
 	return nil
 }
 

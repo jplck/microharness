@@ -9,7 +9,6 @@ import (
 	"net/url"
 	"slices"
 	"strings"
-	"time"
 	"unicode"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -27,53 +26,57 @@ type tuiResult struct {
 	saved bool
 }
 
-type tuiSessionTick uint64
-
 type tuiToolCatalogResult tuiResult
 type tuiAgentDeleteResult tuiResult
-
-type tuiSessionResult struct {
-	generation uint64
-	result     tuiResult
-}
+type tuiRetractResult tuiResult
 
 type tuiModel struct {
-	ctx               context.Context
-	client            *http.Client
-	page              string
-	environment       string
-	agent             string
-	environments      []string
-	agents            []api.AgentSummary
-	models            []api.Model
-	cursor            int
-	busy              bool
-	status            string
-	failed            bool
-	width             int
-	height            int
-	view              viewport.Model
-	detail            string
-	sessionMessages   []api.Message
-	form              string
-	editingAgent      string
-	deletingAgent     string
-	eraseAgentFiles   bool
-	labels            []string
-	inputs            []textinput.Model
-	text              textarea.Model
-	focus             int
-	modelIndex        int
-	toolChoices       []api.ToolSummary
-	selectedTools     map[string]bool
-	assignableTools   map[string]bool
-	assignPermission  bool
-	toolCursor        int
-	allowedModels     map[string]bool
-	childModelChoices []string
-	childModelCursor  int
-	sessionGeneration uint64
-	sessionLoading    bool
+	ctx                 context.Context
+	client              *http.Client
+	page                string
+	environment         string
+	agent               string
+	environments        []string
+	agents              []api.AgentSummary
+	models              []api.Model
+	cursor              int
+	busy                bool
+	status              string
+	failed              bool
+	width               int
+	height              int
+	view                viewport.Model
+	detail              string
+	sessionMessages     []api.Message
+	deliveries          []api.MessageDelivery
+	delivery            api.MessageDelivery
+	historyParent       string
+	historyParentCursor int
+	retractingMessage   *api.Envelope
+	form                string
+	editingAgent        string
+	deletingAgent       string
+	eraseAgentFiles     bool
+	labels              []string
+	inputs              []textinput.Model
+	text                textarea.Model
+	focus               int
+	modelIndex          int
+	toolChoices         []api.ToolSummary
+	selectedTools       map[string]bool
+	assignableTools     map[string]bool
+	assignPermission    bool
+	toolCursor          int
+	allowedModels       map[string]bool
+	childModelChoices   []string
+	childModelCursor    int
+	sessionGeneration   uint64
+	sessionCtx          context.Context
+	sessionCancel       context.CancelFunc
+	sessionLoading      bool
+	sessionAnimation    uint64
+	sessionFrame        int
+	sessionStatus       api.AgentStatus
 }
 
 func runTUI(cmd *cobra.Command, args []string) error {
@@ -82,6 +85,7 @@ func runTUI(cmd *cobra.Command, args []string) error {
 	client := newRuntimeClient(socketPath)
 	defer client.CloseIdleConnections()
 	model := newTUI(ctx, client)
+	defer model.stopSession()
 	_, err := tea.NewProgram(model, tea.WithAltScreen(), tea.WithContext(ctx)).Run()
 	return err
 }
@@ -95,7 +99,7 @@ func newTUI(ctx context.Context, client *http.Client) *tuiModel {
 		width: 80, height: 24, view: viewport.New(76, 15), text: textarea.New()}
 }
 
-func (model tuiModel) Init() tea.Cmd { return model.load() }
+func (model *tuiModel) Init() tea.Cmd { return model.load() }
 
 func (model tuiModel) request(method, path string, body []byte) tea.Cmd {
 	return func() tea.Msg {
@@ -104,17 +108,18 @@ func (model tuiModel) request(method, path string, body []byte) tea.Cmd {
 	}
 }
 
-func (model tuiModel) load() tea.Cmd {
+func (model *tuiModel) load() tea.Cmd {
 	switch model.page {
 	case "agents":
 		return model.request(http.MethodGet, "/environments/"+url.PathEscape(model.environment)+"/agents", nil)
 	case "inbox":
 		return model.request(http.MethodGet, agentPath(model.environment, model.agent)+"/inbox", nil)
+	case "history":
+		return model.request(http.MethodGet, "/environments/"+url.PathEscape(model.environment)+"/messages?"+url.Values{"agent": {model.agent}}.Encode(), nil)
+	case "message-detail":
+		return model.request(http.MethodGet, messagePath(model.environment, model.delivery.Envelope.ID), nil)
 	case "session":
-		request := model.request(http.MethodGet, agentPath(model.environment, model.agent)+"/session", nil)
-		return func() tea.Msg {
-			return tuiSessionResult{generation: model.sessionGeneration, result: request().(tuiResult)}
-		}
+		return model.startSession()
 	case "models":
 		return func() tea.Msg {
 			models, err := api.ListModels()
@@ -132,19 +137,22 @@ func (model tuiModel) load() tea.Cmd {
 func (model *tuiModel) refresh() tea.Cmd {
 	model.status = ""
 	model.busy, model.failed = true, false
-	if model.page == "session" {
-		model.sessionGeneration++
-		model.sessionLoading = true
+	if model.page != "session" {
+		model.stopSession()
 	}
 	return model.load()
 }
 
-func (model tuiModel) sessionTick() tea.Cmd {
-	return tea.Tick(time.Second, func(time.Time) tea.Msg { return tuiSessionTick(model.sessionGeneration) })
-}
-
 func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
+	case tuiRetractResult:
+		model.retractingMessage = nil
+		model.busy, model.failed = true, message.err != nil
+		model.status = "Message retracted."
+		if message.err != nil {
+			model.status = message.err.Error()
+		}
+		return model, model.load()
 	case tuiAgentDeleteResult:
 		model.deletingAgent = ""
 		model.busy, model.failed = true, message.err != nil
@@ -171,32 +179,16 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if model.page != "session" || model.form != "" || uint64(message) != model.sessionGeneration || model.sessionLoading {
 			return model, nil
 		}
-		model.sessionLoading = true
-		return model, model.load()
-	case tuiSessionResult:
-		if model.page != "session" || message.generation != model.sessionGeneration {
+		return model, model.pollSession()
+	case tuiWorkingTick:
+		if model.page != "session" || model.form != "" || message.generation != model.sessionGeneration ||
+			message.animation != model.sessionAnimation || model.failed || model.sessionStatus.Status != "running" {
 			return model, nil
 		}
-		model.busy, model.sessionLoading = false, false
-		var session api.Session
-		err := message.result.err
-		if err == nil {
-			err = json.Unmarshal(message.result.data, &session)
-		}
-		if err != nil {
-			model.status, model.failed = err.Error(), true
-			return model, model.sessionTick()
-		}
-		if model.failed {
-			model.status, model.failed = "", false
-		}
-		follow := model.detail == "" || model.view.AtBottom()
-		model.sessionMessages = session.Messages
-		model.renderContent()
-		if follow {
-			model.view.GotoBottom()
-		}
-		return model, model.sessionTick()
+		model.sessionFrame = (model.sessionFrame + 1) % 4
+		return model, model.workingTick()
+	case tuiSessionResult:
+		return model, model.updateSession(message)
 	case tea.WindowSizeMsg:
 		model.width, model.height = message.Width, message.Height
 		model.view.Width, model.view.Height = max(1, message.Width-4), max(1, message.Height-9)
@@ -217,10 +209,14 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			command := model.refresh()
 			model.status = "Request accepted."
 			var receipt struct {
-				ID string `json:"id"`
+				ID             string `json:"id"`
+				DeliveryStatus string `json:"delivery_status"`
 			}
 			if json.Unmarshal(message.data, &receipt) == nil && receipt.ID != "" {
 				model.status = "Message accepted: " + receipt.ID
+				if receipt.DeliveryStatus != "" {
+					model.status += " (" + receipt.DeliveryStatus + ")"
+				}
 			}
 			return model, command
 		}
@@ -232,6 +228,20 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			err = json.Unmarshal(message.data, &model.agents)
 		case "models":
 			err = json.Unmarshal(message.data, &model.models)
+		case "history":
+			selected := ""
+			if model.cursor < len(model.deliveries) {
+				selected = model.deliveries[model.cursor].Envelope.ID
+			}
+			err = json.Unmarshal(message.data, &model.deliveries)
+			for index, delivery := range model.deliveries {
+				if delivery.Envelope.ID == selected {
+					model.cursor = index
+					break
+				}
+			}
+		case "message-detail":
+			err = json.Unmarshal(message.data, &model.delivery)
 		case "inbox":
 			var inbox api.InboxState
 			err = json.Unmarshal(message.data, &inbox)
@@ -248,7 +258,7 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				content.WriteString("No pending messages.")
 			}
 			for _, envelope := range inbox.Messages {
-				fmt.Fprintf(&content, "%s -> %s [%s]\nID: %s\nConversation: %s\nReply to: %s\n\n%s\n\n", envelope.Sender, envelope.To, envelope.Source, envelope.ID, envelope.ConversationID, envelope.ReplyTo, envelope.Content)
+				fmt.Fprintf(&content, "%s -> %s [%s]\nID: %s\nConversation: %s\nReply to: %s\nSteer: %s\n\n%s\n\n", envelope.Sender, envelope.To, envelope.Source, envelope.ID, envelope.ConversationID, envelope.ReplyTo, envelope.Steer, envelope.Content)
 			}
 			model.detail = content.String()
 		}
@@ -257,13 +267,31 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		model.cursor = max(0, min(model.cursor, model.count()-1))
 		model.renderContent()
+		if model.page == "history" || model.page == "agents" {
+			model.view.SetYOffset(max(0, model.cursor-model.view.Height+1))
+		}
 		return model, nil
 	case tea.KeyMsg:
 		key := message.String()
 		if key == "ctrl+c" {
+			model.stopSession()
 			return model, tea.Quit
 		}
-		if model.busy {
+		if model.busy && !(model.page == "session" && model.form == "") {
+			return model, nil
+		}
+		if model.retractingMessage != nil {
+			switch key {
+			case "esc":
+				model.retractingMessage = nil
+				model.status = "Retraction cancelled."
+			case "enter", "y":
+				envelope := model.retractingMessage
+				body, _ := json.Marshal(map[string]string{"Source": "tui", "Sender": envelope.Sender})
+				model.busy = true
+				request := model.request(http.MethodPost, messagePath(model.environment, envelope.ID)+"/retract", body)
+				return model, func() tea.Msg { return tuiRetractResult(request().(tuiResult)) }
+			}
 			return model, nil
 		}
 		if model.deletingAgent != "" {
@@ -292,6 +320,7 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch key {
 		case "q":
+			model.stopSession()
 			return model, tea.Quit
 		case "home", "end":
 			if model.page == "session" {
@@ -305,6 +334,16 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "r":
 			return model, model.refresh()
 		case "esc", "backspace":
+			if model.page == "message-detail" {
+				model.page = "history"
+				model.view.GotoTop()
+				return model, model.refresh()
+			}
+			if model.page == "history" {
+				model.page, model.cursor = model.historyParent, model.historyParentCursor
+				model.view.GotoTop()
+				return model, model.refresh()
+			}
 			if model.page == "inbox" || model.page == "session" {
 				model.page = "agents"
 			} else {
@@ -316,6 +355,29 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		case "m":
 			model.page, model.cursor = "models", 0
 			return model, model.refresh()
+		case "h":
+			if model.page == "agents" && len(model.agents) > 0 {
+				model.agent = model.agents[model.cursor].Name
+			} else if model.page != "inbox" && model.page != "session" {
+				return model, nil
+			}
+			model.historyParent, model.historyParentCursor = model.page, model.cursor
+			model.page, model.cursor, model.deliveries = "history", 0, nil
+			model.view.GotoTop()
+			return model, model.refresh()
+		case "x":
+			if delivery := model.selectedDelivery(); delivery != nil {
+				if delivery.Envelope.Source != "tui" {
+					model.status, model.failed = "Only messages sent from TUI can be retracted here.", true
+				} else if delivery.Status != "queued" {
+					model.status, model.failed = "Only queued messages can be retracted.", true
+				} else {
+					envelope := delivery.Envelope
+					model.retractingMessage = &envelope
+					model.status, model.failed = "", false
+				}
+			}
+			return model, nil
 		case "n":
 			if model.page == "environments" {
 				return model, model.openForm("environment")
@@ -359,6 +421,11 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				return model, model.request(http.MethodPost, agentPath(model.environment, model.agent)+"/inbox/retry", nil)
 			}
 		case "enter":
+			if model.page == "history" && len(model.deliveries) > 0 {
+				model.delivery, model.page = model.deliveries[model.cursor], "message-detail"
+				model.view.GotoTop()
+				return model, model.refresh()
+			}
 			if model.page == "environments" && len(model.environments) > 0 {
 				model.environment, model.page = model.environments[model.cursor], "agents"
 			} else if model.page == "agents" && len(model.agents) > 0 {
@@ -370,7 +437,7 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			model.view.GotoTop()
 			return model, model.refresh()
 		case "up", "k", "down", "j":
-			if model.page == "environments" || model.page == "agents" {
+			if model.page == "environments" || model.page == "agents" || model.page == "history" {
 				if key == "up" || key == "k" {
 					model.cursor--
 				} else {
@@ -392,10 +459,23 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (model tuiModel) count() int {
+	if model.page == "history" || model.page == "message-detail" {
+		return len(model.deliveries)
+	}
 	if model.page == "agents" {
 		return len(model.agents)
 	}
 	return len(model.environments)
+}
+
+func (model *tuiModel) selectedDelivery() *api.MessageDelivery {
+	if model.page == "message-detail" {
+		return &model.delivery
+	}
+	if model.page == "history" && model.cursor >= 0 && model.cursor < len(model.deliveries) {
+		return &model.deliveries[model.cursor]
+	}
+	return nil
 }
 
 func (model *tuiModel) openForm(kind string) tea.Cmd {
@@ -406,8 +486,7 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 		model.editingAgent, kind = existing.Name, "agent"
 	}
 	if model.page == "session" {
-		model.sessionGeneration++
-		model.sessionLoading = false
+		model.stopSession()
 	}
 	model.form, model.focus, model.modelIndex = kind, 0, 0
 	model.toolChoices, model.toolCursor = nil, 0
@@ -435,7 +514,7 @@ func (model *tuiModel) openForm(kind string) tea.Cmd {
 		}
 	}
 	if kind == "message" {
-		model.labels = []string{"Sender", "Conversation ID", "Reply to"}
+		model.labels = []string{"Sender", "Conversation ID", "Reply to", "Steer target (optional)"}
 	}
 	model.inputs = make([]textinput.Model, len(model.labels))
 	for index := range model.inputs {
@@ -641,7 +720,7 @@ func (model *tuiModel) submit() tea.Cmd {
 		path = agentPath(model.environment, first) + "?" + query.Encode()
 	case "message":
 		path = "/environments/" + url.PathEscape(model.environment) + "/messages"
-		body, _ = json.Marshal(api.Envelope{Source: "tui", Sender: first, To: model.agent, Content: model.text.Value(), ConversationID: model.inputs[1].Value(), ReplyTo: model.inputs[2].Value()})
+		body, _ = json.Marshal(api.Envelope{Source: "tui", Sender: first, To: model.agent, Content: model.text.Value(), ConversationID: model.inputs[1].Value(), ReplyTo: model.inputs[2].Value(), Steer: strings.TrimSpace(model.inputs[3].Value())})
 	}
 	model.busy, model.failed = true, false
 	return model.request(method, path, body)
@@ -675,6 +754,7 @@ func (model tuiModel) renderSession() string {
 	for _, entry := range model.sessionMessages {
 		label, body, color := strings.ToUpper(entry.Role), entry.Content, lipgloss.Color("244")
 		var metadata []string
+		steer := entry.Steer
 		switch entry.Role {
 		case "user":
 			color = lipgloss.Color("45")
@@ -690,6 +770,9 @@ func (model tuiModel) renderSession() string {
 					}
 					label += " / " + envelope.Sender
 					body = envelope.Content
+					if steer == "" {
+						steer = envelope.Steer
+					}
 					if envelope.ConversationID != "" {
 						metadata = append(metadata, "Conversation: "+envelope.ConversationID)
 					}
@@ -709,6 +792,12 @@ func (model tuiModel) renderSession() string {
 		}
 		if entry.EnvelopeID != "" {
 			metadata = append(metadata, "Envelope: "+entry.EnvelopeID)
+		}
+		if steer != "" {
+			metadata = append(metadata, "Steer: "+steer)
+		}
+		if entry.RunID != "" {
+			metadata = append(metadata, "Run: "+entry.RunID)
 		}
 		if entry.ToolCallID != "" {
 			metadata = append(metadata, "Tool result: "+entry.ToolCallID)
@@ -741,6 +830,27 @@ func (model *tuiModel) renderContent() {
 	var content strings.Builder
 	accent := lipgloss.NewStyle().Foreground(lipgloss.Color("42")).Bold(true)
 	switch model.page {
+	case "history":
+		if len(model.deliveries) == 0 {
+			content.WriteString("No message history.")
+		}
+		for index, delivery := range model.deliveries {
+			envelope := delivery.Envelope
+			line := fmt.Sprintf("%s | %s | %s -> %s", delivery.Status, envelope.ID, envelope.Sender, envelope.To)
+			line = lipgloss.NewStyle().MaxWidth(max(1, model.view.Width-2)).MaxHeight(1).Render(terminalText(line))
+			if index == model.cursor {
+				content.WriteString(accent.Render("> "+line) + "\n")
+			} else {
+				content.WriteString("  " + line + "\n")
+			}
+		}
+	case "message-detail":
+		envelope := model.delivery.Envelope
+		fmt.Fprintf(&content, "Status: %s\nID: %s\nSource: %s\nSender: %s\nTo: %s\nSteer: %s\nConversation: %s\nReply to: %s\n\n%s",
+			model.delivery.Status, envelope.ID, envelope.Source, envelope.Sender, envelope.To, envelope.Steer, envelope.ConversationID, envelope.ReplyTo, envelope.Content)
+		text := terminalText(content.String())
+		content.Reset()
+		content.WriteString(text)
 	case "environments", "agents":
 		if model.count() == 0 {
 			content.WriteString("No " + model.page + ".")
@@ -899,22 +1009,28 @@ func (model tuiModel) View() string {
 		return "Micro\nTerminal too small (minimum 40 x 22).\nCtrl+C to quit.\n"
 	}
 	title := "MICRO / " + strings.ToUpper(model.page)
-	if model.page == "agents" || model.page == "inbox" || model.page == "session" {
+	if model.page == "agents" || model.page == "inbox" || model.page == "session" || model.page == "history" || model.page == "message-detail" {
 		title += " / " + terminalText(model.environment)
 	}
-	if model.page == "inbox" || model.page == "session" {
+	if model.page == "inbox" || model.page == "session" || model.page == "history" || model.page == "message-detail" {
 		title += " / " + terminalText(model.agent)
 	}
 	body := model.view.View()
 	help := "up/down select | enter open | n new | m models | r refresh | esc back | q quit"
 	if model.page == "agents" {
-		help = "enter inbox | v session | n new | e edit | d delete | s message | r refresh | esc back | q quit"
+		help = "enter inbox | v session | h history | n new | e edit | d delete | s message | r refresh | esc back | q quit"
 	}
 	if model.page == "inbox" {
-		help = "v session | s message | t retry | r refresh | up/down scroll | esc back | q quit"
+		help = "h history | v session | s message | t retry | r refresh | up/down scroll | esc back | q quit"
 	}
 	if model.page == "session" {
-		help = "s message | up/down scroll | end follow | r refresh | esc agents | q quit"
+		help = "h history | s message | up/down scroll | end follow | r refresh | esc agents | q quit"
+	}
+	if model.page == "history" {
+		help = "↑/↓ select | enter read | x retract\nr refresh | esc back | q quit"
+	}
+	if model.page == "message-detail" {
+		help = "↑/↓ scroll | x retract | r refresh\nesc history | q quit"
 	}
 	if model.page == "models" {
 		help = "up/down scroll | r refresh | esc back | q quit"
@@ -964,15 +1080,36 @@ func (model tuiModel) View() string {
 			"\n\nShared memory and other agents stay."
 		help = "up/down choose | enter delete | esc cancel"
 	}
+	if model.retractingMessage != nil {
+		title = "MICRO / RETRACT MESSAGE"
+		envelope := model.retractingMessage
+		body = fmt.Sprintf("Retract this queued TUI message?\n\nID: %s\nSender: %s\nTo: %s\n\nDelivery may already have started.", envelope.ID, envelope.Sender, envelope.To)
+		body = lipgloss.NewStyle().Width(model.width - 4).Render(terminalText(body))
+		help = "enter/y retract | esc cancel"
+	}
 	status := terminalText(model.status)
-	if model.page == "session" && model.form == "" && status == "" {
-		status = "Live | following latest"
+	if model.page == "session" && model.form == "" && !model.failed {
+		activity := "Live | following latest"
 		if !model.view.AtBottom() {
-			status = "Live | reading history"
+			activity = "Live | reading history"
 		}
+		switch model.sessionStatus.Status {
+		case "running":
+			activity = string("|/-\\"[model.sessionFrame]) + " Working | " + activity
+		case "paused":
+			activity = "PAUSED: " + terminalText(model.sessionStatus.Error)
+		default:
+			if model.sessionStatus.Status != "" {
+				activity += " | " + strings.ToUpper(model.sessionStatus.Status)
+			}
+		}
+		if status != "" {
+			activity += " | " + status
+		}
+		status = activity
 	}
 	color := lipgloss.Color("42")
-	if model.failed {
+	if model.failed || model.page == "session" && model.form == "" && model.sessionStatus.Status == "paused" {
 		color = lipgloss.Color("203")
 	}
 	if model.busy {

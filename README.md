@@ -50,14 +50,22 @@ socket, pass `--socket /path/to/micro.sock` to both commands.
   deleted, the first remaining agent becomes the default.
   Retained files stay on disk but are no longer listed in the TUI.
 - Press `s` on an agent, its inbox, or its live session to compose a message, including optional
-  conversation and reply IDs.
+  conversation, reply, and steering-target IDs. A blank steering target starts
+  an independent message; a target ID steers that unfinished run.
+- Press `h` on an agent, its inbox, or its live session for durable message history.
+  Use arrows to select, Enter to read, and `r` to refresh. Press `x` on a queued
+  TUI-sent message to request retraction; Enter or `y` confirms and Esc cancels.
+  Agent/runtime messages cannot be retracted by impersonating their sender.
+  Retracted and cancelled entries remain in history.
 - Press `v` on an agent or its inbox to open its live session: messages, tool
-  calls, tool results, and completed responses. It refreshes every second and
-  follows the latest activity. Scroll up to read history; End resumes following.
-  Esc returns to the agent list and stops polling. This shows saved messages,
-  not token-by-token output while the model is generating a response.
+  calls, tool results, and completed responses. The view refreshes saved messages
+  and agent status every second, with an animated working indicator while the
+  agent is running. There is no token streaming or partial-response display.
+  Scroll up to read history; End resumes following the latest activity.
+  Esc returns to the agent list and stops polling, not the agent's work.
   Composing a message pauses polling; sending or cancelling returns to the live
-  session and resumes updates. Failed sends keep your draft for correction or retry.
+  session and resumes updates. Failed sends keep your message draft for correction
+  or retry. Refresh errors are shown and retried; paused agents show their error.
 - Press `m` from a list to view configured models, `r` to refresh, and `t` in an
   inbox to retry paused work. Inbox views show pending messages, not completed
   session output. Lists and inboxes are refreshed manually.
@@ -89,22 +97,78 @@ go run main.go environment inbox team researcher
 system prompt and persists them across restarts. Omitting the flag keeps the
 default prompt. This creates a new agent; it does not update an existing agent.
 
+The default instructions encourage agents to try permitted tool creation or
+delegation before declaring a missing capability. A child granted `create_tool`
+is instructed to build reusable, parameterized tools, execute them, and return
+the answer rather than stopping at tool creation. For example, a Seattle
+time-and-activities request should use generic time/search tools with timezone
+and query parameters, not city-specific tools. The prompt also requires honest
+failure reporting, verification of real task results, and respect for Use/Assign
+permissions and private tool ownership. These are model instructions, not new
+permissions or a guarantee of model behavior. Existing sessions receive the
+updated default prompt when their environment is loaded, preserving history
+and agent-specific instructions.
+
 `message` prints the accepted envelope ID, not the recipient's answer. The agent's
 conversation and final output are saved in its session file. Each agent receives
-`list_agents`, `agent_status`, and `message` tools automatically, including after reload.
+`list_agents`, `agent_status`, `message`, `message_status`, and `retract_message`
+tools automatically, including after reload.
 
-The model-facing `message` tool accepts `to`, `content`, and optional `reply_to`.
+The model-facing `message` tool accepts `to`, `content`, and optional `reply_to`
+and `steer`.
 The runtime supplies the sender identity and inherits the current conversation
 ID. Agents send replies explicitly using the incoming sender and envelope ID;
 final model output is not automatically sent back as another message.
-The tool's receipt includes a `recipient` status snapshot in addition to the
-accepted ID. `agent_status` accepts `{"name":"timekeeper"}` and reports `idle`,
+The tool's receipt includes a `recipient` status snapshot and `delivery_status`
+in addition to the accepted ID. `agent_status` accepts `{"name":"timekeeper"}` and reports `idle`,
 `queued`, `running`, or `paused`, the pending count (including active work), the
 active envelope ID when running, and any inbox error. These are agent processing
 states, not proof that a delegated task has been completed. The TUI displays them
 in agent lists and inbox views; refresh those views with `r`.
 
-CLI messages also support `--sender`, `--conversation`, and `--reply-to`.
+CLI messages also support `--sender`, `--conversation`, `--reply-to`, and `--steer`.
+
+### Retraction and steering
+
+Keep message receipt IDs. `message_status({"id":"..."})` reports a sender's
+outgoing message as `queued`, `delivered`, `completed`, `retracted`, or `cancelled`.
+`delivered` means committed to a run's session, not that a model has finished
+reading or acting on it. `completed` means the run finished, not that its answer
+is correct. History is stored with the environment and survives restart.
+
+`retract_message({"id":"..."})` removes only the caller's own queued, undelivered
+message. Delivery reservation and retraction are serialized: if the worker has
+already claimed the message, retraction is too late. Repeating a successful
+retraction is harmless. Retracting a queued original request also cancels its
+queued steering messages. Delivered messages and effects cannot be undone.
+Deleting an agent cancels its unfinished deliveries; message audit history
+remains even when its session/plugin files are erased.
+
+To change ongoing work, send a message with `steer` equal to the original
+request's envelope ID and `to` equal to its recipient. Steering inherits the
+target's conversation; an explicitly conflicting conversation is rejected.
+It is not a new independent task, and `reply_to` alone does not make a message
+steering. Unknown, finished, cancelled, and steering-message targets are rejected.
+
+Steering is consumed before the next model request or between tool executions.
+It does not interrupt a model request or a tool already executing. Unstarted
+calls from the previous tool batch receive explicit "not executed" results so
+the model can reconsider them while preserving valid tool-call/result history.
+The run's original reply routing stays intact. Steering queued while a model
+generates a final response is processed before the run is marked complete.
+Paused runs retain steering but still require an operator retry.
+
+There is no semantic deduplication: ordinary messages remain independent even
+within one conversation. An agent that notices an accidental duplicate should
+retract its receipt ID, not append another request telling the recipient to
+ignore it. External adapters supply their own source/sender identity; only
+internal model tools can act as an agent.
+
+```sh
+go run main.go environment message team researcher "Use the existing tool instead." --steer ORIGINAL_ENVELOPE_ID
+go run main.go environment message-status team STEERING_ENVELOPE_ID
+go run main.go environment retract-message team QUEUED_ENVELOPE_ID --sender cli
+```
 
 ## Autonomous agent creation
 
@@ -228,13 +292,27 @@ within the creating agent; different agents may create tools with the same name.
 ## Agent-created plugins
 
 Enable Use for `create_tool` on a trusted agent. It accepts `name`, `source`
-(a complete Go main package, max 64 KiB), `test_arguments` (a JSON object encoded
-as a string), and `expected_output` (the exact result string). It builds against
-the runtime's embedded copy of the same SDK, validates `describe`, and runs a
-sample `call` before registering exactly one tool. The example above works
+(a complete Go main package, max 64 KiB), `test_source` (a Go `package main` test
+file, max 64 KiB), `test_arguments` (a JSON object encoded as a string), and
+`expected_output` (the exact result string). It builds against the runtime's
+embedded copy of the same SDK, requires a passing, non-skipped `TestToolSuccess`
+via uncached `go test -json`, validates `describe`, and runs a successful
+exact-match sample `call` before registering exactly one tool. The example above works
 unchanged as `source`. Only the standard library and the SDK are available;
 module downloads, CGO, workspace overrides, and automatic toolchain downloads
 are disabled. A local Go 1.25+ toolchain is required for creation.
+
+Factor the real tool handler into a testable function and exercise its
+successful behavior in `TestToolSuccess`, with assertions on meaningful results.
+For changing web responses, use deterministic `httptest` fixtures that drive
+the real HTTP/parsing path; for clock logic, test a known timestamp. Error-path
+tests may supplement this, but an invalid location or unavailable endpoint is
+not success-path validation. Return production failures as errors, not
+success-shaped `"ERROR: ..."` strings. The runtime rejects missing, skipped,
+failing, or non-executed success tests; it cannot prove that arbitrary submitted
+Go assertions faithfully test the intended semantics. A passing fixture test
+also does not establish that a live service is available: call the registered
+tool on the actual task before reporting success.
 
 The creating agent can invoke its tool immediately, even in the same tool-call
 batch. Source and binaries persist under the environment's `plugins` directory:
@@ -243,6 +321,7 @@ batch. Source and binaries persist under the environment's `plugins` directory:
 data/<environment>/plugins/<agent>-<tool-name>-<unique-id>/
   bin/<tool-name>
   main.go
+  main_test.go
   go.mod
   toolplugin/plugin.go
 ```
@@ -253,10 +332,20 @@ files from deleted agents. Saved agent state references the relative executable
 path. Startup runs `describe`, not the sample call, to restore its schema. Missing or
 invalid private binaries fail restoration. Tools remain private and cannot be
 assigned to children. Editing an agent preserves them; unchecking Use for
-`create_tool` disables both creation and use of its private plugins. Re-enabling
-it restores access. Individual replacement, deletion, and sharing of private
-plugins are not implemented. Failed samples and failed state saves do not
+`create_tool` disables creation, updates, and use of its private plugins. Re-enabling
+it restores access. Individual deletion and sharing of private plugins are not
+implemented. Failed tests, samples, and state saves do not
 register a tool, though any effects of executing the sample cannot be undone.
+
+Agents with `create_tool` also receive `update_tool` automatically. It takes the
+same arguments and replaces only an existing private tool owned by that agent,
+under the same name. Native tools and other agents' tools cannot be replaced.
+The new version is built and validated in isolation, then the environment's
+reference is switched atomically. Failed validation or persistence leaves the
+current version intact; competing updates to the same version report a conflict.
+Already-started calls keep their immutable executable. Prior version paths
+remain recorded for ownership and are erased along with the current version
+when deleting the agent with file erasure enabled.
 
 Only the named layout above is supported; older directory-only references are
 not migrated or loaded.
@@ -267,7 +356,7 @@ old external-tool grants must have those grants removed before startup.
 
 ## Execution and sandboxing
 
-**Plugins are not sandboxed yet.** Discovery, compilation, sample tests, and
+**Plugins are not sandboxed yet.** Discovery, compilation, Go tests, sample calls, and
 normal calls execute with the runtime user's OS access. Grant creation only to
 trusted agents. A restricted environment and
 temporary working directory are not security boundaries; plugins can access
@@ -278,11 +367,12 @@ LANG. Compilation also receives HOME and the Go build-cache path. Model API key
 environment variables are not passed. Plugin requests are limited to 128 KiB;
 stdout and stderr each to 1 MiB.
 Discovery has a 10-second timeout, plugin calls 30 seconds, and compilation
-90 seconds. Cancellation kills the direct process; there are no memory, CPU,
+90 seconds. Go tests use a 30-second test timeout and a 90-second command deadline,
+also bounded by the enclosing operation. Cancellation kills the direct process; there are no memory, CPU,
 or descendant-process guarantees.
 
 Native handlers accept JSON objects up to 128 KiB and return strings up to 1 MiB.
-They receive a 30-second context deadline, or 120 seconds for `create_tool`,
+They receive a 30-second context deadline, or 120 seconds for `create_tool` and `update_tool`,
 and honor earlier caller cancellation. Native execution is cooperatively
 cancelled; the runtime does not kill an in-process handler.
 
@@ -327,7 +417,8 @@ Completed session turns are recognized when acknowledging an inbox message is
 interrupted. Persisted tool results are reused when resuming incomplete turns.
 This is not an exactly-once guarantee: a crash after a tool side effect but before
 its result is saved can repeat that effect. Side-effecting tools should support
-idempotency. Repeated IDs are deduplicated while an envelope remains queued.
+idempotency. Recorded explicit message IDs are not re-enqueued when repeated.
+This does not identify equivalent text submitted with new IDs.
 
 Use one process per environment data directory.
 
@@ -373,8 +464,16 @@ The Unix-socket API exposes:
   snapshot (`messages`), available even while the agent is processing work.
 - `POST /environments/{id}/messages`: an `Envelope` JSON object using the Go field
   names (`Source`, `Sender`, `To`, `Content`, `ConversationID`, `ReplyTo`, optional
-  `ID`); returns HTTP 202 with `id` and `status`. Sources `agent` and `runtime`
-  are reserved and rejected from external HTTP clients.
+  `ID` and `Steer`); returns HTTP 202 with `id`, `status`, and `delivery_status`.
+  Sources `agent` and `runtime` are reserved and rejected from external HTTP clients.
+  Invalid/finished steering targets return 409, not a new independent task.
+- `GET /environments/{id}/messages`: durable delivery history; optional `agent`
+  query filters by recipient or agent sender.
+- `GET /environments/{id}/messages/{message}`: one message's delivery state and envelope.
+- `POST /environments/{id}/messages/{message}/retract`: JSON `{"Source":"cli","Sender":"cli"}`
+  identifies the external sender. Returns the retracted delivery record, 403
+  for wrong ownership, 404 if absent, or 409 if delivery has already started.
+  Reserved agent/runtime sources are rejected.
 - `GET /environments/{id}/agents/{name}/inbox`: pending `messages`, processing
   `status`, active envelope ID when running, and an optional `error` describing
   why the inbox is paused.

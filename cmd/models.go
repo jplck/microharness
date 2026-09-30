@@ -83,15 +83,39 @@ var environmentMessageCmd = &cobra.Command{
 		sender, _ := cmd.Flags().GetString("sender")
 		conversation, _ := cmd.Flags().GetString("conversation")
 		replyTo, _ := cmd.Flags().GetString("reply-to")
+		steer, _ := cmd.Flags().GetString("steer")
 		data, err := json.Marshal(api.Envelope{
 			Source: "cli", Sender: sender, To: args[1], Content: args[2],
-			ConversationID: conversation, ReplyTo: replyTo,
+			ConversationID: conversation, ReplyTo: replyTo, Steer: steer,
 		})
 		if err != nil {
 			return err
 		}
 		return runtimeRequest(cmd, http.MethodPost, "/environments/"+url.PathEscape(args[0])+"/messages", bytes.NewReader(data))
 	},
+}
+
+var environmentMessageStatusCmd = &cobra.Command{
+	Use: "message-status <environment> <id>", Short: "Show message delivery status", Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runtimeRequest(cmd, http.MethodGet, messagePath(args[0], args[1]), nil)
+	},
+}
+
+var environmentRetractMessageCmd = &cobra.Command{
+	Use: "retract-message <environment> <id>", Short: "Retract your own queued CLI message", Args: cobra.ExactArgs(2),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		sender, _ := cmd.Flags().GetString("sender")
+		body, err := json.Marshal(map[string]string{"Source": "cli", "Sender": sender})
+		if err != nil {
+			return err
+		}
+		return runtimeRequest(cmd, http.MethodPost, messagePath(args[0], args[1])+"/retract", bytes.NewReader(body))
+	},
+}
+
+func messagePath(environment, id string) string {
+	return "/environments/" + url.PathEscape(environment) + "/messages/" + url.PathEscape(id)
 }
 
 var environmentInboxCmd = &cobra.Command{
@@ -180,6 +204,8 @@ func init() {
 	environmentMessageCmd.Flags().String("sender", "cli", "External sender identity")
 	environmentMessageCmd.Flags().String("conversation", "", "Conversation ID (generated when omitted)")
 	environmentMessageCmd.Flags().String("reply-to", "", "Envelope ID being answered")
-	environmentCmd.AddCommand(environmentMessageCmd, environmentInboxCmd, environmentRetryInboxCmd)
+	environmentMessageCmd.Flags().String("steer", "", "Steering target envelope or run ID (blank queues normally)")
+	environmentRetractMessageCmd.Flags().String("sender", "cli", "Original external sender identity")
+	environmentCmd.AddCommand(environmentMessageCmd, environmentMessageStatusCmd, environmentRetractMessageCmd, environmentInboxCmd, environmentRetryInboxCmd)
 	rootCmd.AddCommand(environmentCmd)
 }

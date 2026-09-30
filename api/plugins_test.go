@@ -14,6 +14,21 @@ import (
 
 var examplePluginSource string
 
+const examplePluginTestSource = `package main
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestToolSuccess(t *testing.T) {
+	result, err := echoTool().Call(json.RawMessage("{\"input\":\"hello\"}"))
+	if err != nil || result != "hello" {
+		t.Fatalf("echo success: %q %v", result, err)
+	}
+}
+`
+
 func TestMain(tests *testing.M) {
 	source, err := os.ReadFile("../examples/echo/main.go")
 	if err != nil {
@@ -27,7 +42,7 @@ func TestMain(tests *testing.M) {
 func TestNativeToolRegistry(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	registry := DefaultTools()
-	if len(registry) != 9 {
+	if len(registry) != 12 {
 		t.Fatalf("tool count: %d", len(registry))
 	}
 	for name, tool := range registry {
@@ -52,7 +67,7 @@ func TestCreatePlugin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := CreatePluginRequest{Name: "echo", Source: examplePluginSource, TestArguments: `{"input":"hello"}`, ExpectedOutput: "hello"}
+	request := CreatePluginRequest{Name: "echo", Source: examplePluginSource, TestSource: examplePluginTestSource, TestArguments: `{"input":"hello"}`, ExpectedOutput: "hello"}
 	arguments, _ := json.Marshal(request)
 	agent.Client = messageTestModel{call: func(ctx context.Context, messages []Message) (Message, error) {
 		if messages[len(messages)-1].Role == "user" {
@@ -96,13 +111,13 @@ func TestCreatePlugin(t *testing.T) {
 	if err := restored.UpdateAgent(ctx, "maker", "test-model", "updated", []Tool{DefaultTools()["create_tool"]}); err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.currentTools()) != 8 {
+	if len(loaded.currentTools()) != 11 {
 		t.Fatal("private tool not restored")
 	}
 	if err := restored.SetAgentTools(ctx, "maker", nil); err != nil {
 		t.Fatal(err)
 	}
-	if len(loaded.currentTools()) != 6 || len(loaded.plugins) != 1 {
+	if len(loaded.currentTools()) != 8 || len(loaded.plugins) != 1 {
 		t.Fatal("disabling creation should retain but disable private tools")
 	}
 	if err := restored.CreatePlugin(ctx, "maker", request); !errors.Is(err, ErrInvalidTool) {
@@ -152,6 +167,7 @@ func TestPrivatePluginNamesAcrossAgents(t *testing.T) {
 		}
 		request := CreatePluginRequest{
 			Name: "toolplugin", Source: strings.Replace(examplePluginSource, `Name: "echo"`, `Name: "toolplugin"`, 1),
+			TestSource:    examplePluginTestSource,
 			TestArguments: `{"input":"hello"}`, ExpectedOutput: "hello",
 		}
 		if err := env.CreatePlugin(ctx, owner, request); err != nil {
@@ -183,7 +199,7 @@ func TestPluginCreationFailures(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request := CreatePluginRequest{Name: "echo", Source: examplePluginSource, TestArguments: `{"input":"hello"}`, ExpectedOutput: "wrong"}
+	request := CreatePluginRequest{Name: "echo", Source: examplePluginSource, TestSource: examplePluginTestSource, TestArguments: `{"input":"hello"}`, ExpectedOutput: "wrong"}
 	if err := env.CreatePlugin(ctx, "maker", request); err == nil {
 		t.Fatal("failed sample accepted")
 	}

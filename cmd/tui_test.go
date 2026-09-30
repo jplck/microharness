@@ -67,7 +67,7 @@ func TestTUICreateAgentAndMessage(t *testing.T) {
 				t.Error(err)
 			}
 			w.WriteHeader(http.StatusAccepted)
-			io.WriteString(w, `{"id":"envelope-1","status":"accepted"}`)
+			io.WriteString(w, `{"id":"envelope-1","status":"accepted","delivery_status":"queued"}`)
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL)
 			w.WriteHeader(http.StatusNotFound)
@@ -108,16 +108,246 @@ func TestTUICreateAgentAndMessage(t *testing.T) {
 	model.text.SetValue("Hello\nPlease investigate.")
 	model.inputs[1].SetValue("conversation-1")
 	model.inputs[2].SetValue("parent-1")
+	model.inputs[3].SetValue("run-1")
 	_, command = model.Update(tea.KeyMsg{Type: tea.KeyCtrlS})
 	model.Update(command())
-	if sent.To != "researcher" || sent.Source != "tui" || sent.Sender != "tui" || sent.Content != "Hello\nPlease investigate." || sent.ConversationID != "conversation-1" || sent.ReplyTo != "parent-1" {
+	if sent.To != "researcher" || sent.Source != "tui" || sent.Sender != "tui" || sent.Content != "Hello\nPlease investigate." || sent.ConversationID != "conversation-1" || sent.ReplyTo != "parent-1" || sent.Steer != "run-1" {
 		t.Fatalf("message fields changed: %+v", sent)
 	}
-	if !strings.Contains(model.status, "envelope-1") {
+
+	if !strings.Contains(model.status, "envelope-1") || !strings.Contains(model.status, "(queued)") {
 		t.Fatal("missing delivery receipt")
 	}
 }
 
+func TestTUIMessageHistoryAndRetraction(t *testing.T) {
+	for _, response := range []int{http.StatusOK, http.StatusConflict, http.StatusForbidden} {
+		t.Run(http.StatusText(response), func(t *testing.T) {
+			deliveries := []api.MessageDelivery{
+				{Envelope: api.Envelope{ID: "agent-message", Source: "agent", Sender: "worker", To: "other"}, Status: "queued"},
+				{Envelope: api.Envelope{ID: "own-message", Source: "tui", Sender: "alice", To: "worker", Steer: "run-1", Content: "A readable\nmessage body"}, Status: "queued"},
+			}
+			posts := 0
+			client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method + " " + r.URL.Path {
+				case "GET /environments/team/messages":
+					if r.URL.Query().Get("agent") != "worker" {
+						t.Errorf("wrong agent query: %s", r.URL)
+					}
+					json.NewEncoder(w).Encode(deliveries)
+				case "GET /environments/team/messages/own-message":
+					json.NewEncoder(w).Encode(deliveries[1])
+				case "POST /environments/team/messages/own-message/retract":
+					posts++
+					var owner map[string]string
+					json.NewDecoder(r.Body).Decode(&owner)
+					if owner["Source"] != "tui" || owner["Sender"] != "alice" {
+						t.Errorf("forged owner: %+v", owner)
+					}
+					if response != http.StatusOK {
+						if response == http.StatusConflict {
+							deliveries[1].Status = "delivered"
+						}
+						http.Error(w, "retraction rejected", response)
+						return
+					}
+					deliveries[1].Status = "retracted"
+					json.NewEncoder(w).Encode(deliveries[1])
+				case "GET /environments/team/agents":
+					io.WriteString(w, `[{"name":"other"},{"name":"worker"}]`)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			})
+			model := newTUI(t.Context(), client)
+			model.page, model.environment, model.busy = "agents", "team", false
+			model.agents, model.cursor = []api.AgentSummary{{Name: "other"}, {Name: "worker"}}, 1
+			_, load := model.Update(tuiKey("h"))
+			if load == nil || model.page != "history" {
+				t.Fatal("history did not open")
+			}
+			model.Update(load())
+			if len(model.deliveries) != 2 || !strings.Contains(model.View(), "agent-message") {
+				t.Fatal("missing selectable history")
+			}
+			model.Update(tuiKey("x"))
+			if model.retractingMessage != nil || !model.failed {
+				t.Fatal("agent source allowed to retract")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyDown})
+			_, load = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			model.Update(load())
+			for _, text := range []string{"Status: queued", "ID: own-message", "Source: tui", "Sender: alice", "To: worker", "Steer: run-1", "A readable", "message body"} {
+				if !strings.Contains(ansi.Strip(model.View()), text) {
+					t.Fatalf("missing message detail %q:\n%s", text, model.View())
+				}
+			}
+			model.Update(tuiKey("x"))
+			if model.retractingMessage == nil {
+				t.Fatal("missing confirmation")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			if model.retractingMessage != nil || posts != 0 {
+				t.Fatal("cancel retracted message")
+			}
+			model.Update(tuiKey("x"))
+			_, retract := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			if retract == nil || !model.busy {
+				t.Fatal("confirmation did not submit")
+			}
+			if _, duplicate := model.Update(tuiKey("y")); duplicate != nil {
+				t.Fatal("duplicate submission")
+			}
+			_, reload := model.Update(retract())
+			model.Update(reload())
+			if posts != 1 || model.retractingMessage != nil || model.failed != (response != http.StatusOK) {
+				t.Fatalf("incorrect retraction result: %s", model.status)
+			}
+			if response != http.StatusOK && (!strings.Contains(model.status, "retraction rejected") || !strings.Contains(model.status, http.StatusText(response))) {
+				t.Fatalf("missing failure: %s", model.status)
+			}
+			if response == http.StatusOK && model.delivery.Status != "retracted" {
+				t.Fatal("retracted status not refreshed")
+			}
+			_, reload = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			model.Update(reload())
+			if model.page != "history" || model.cursor != 1 || len(model.deliveries) != 2 {
+				t.Fatal("history lost selection or retracted entry")
+			}
+			_, reload = model.Update(tuiKey("r"))
+			model.Update(reload())
+			_, reload = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			model.Update(reload())
+			if model.page != "agents" || model.cursor != 1 {
+				t.Fatal("history did not return to selected agent")
+			}
+		})
+	}
+}
+
+func TestTUIRetractionGating(t *testing.T) {
+	for _, source := range []string{"tui", "cli", "agent", "runtime", ""} {
+		for _, status := range []string{"queued", "delivered", "completed", "retracted", "cancelled"} {
+			t.Run(source+"/"+status, func(t *testing.T) {
+				model := newTUI(t.Context(), nil)
+				model.page, model.busy = "history", false
+				model.deliveries = []api.MessageDelivery{{Envelope: api.Envelope{ID: "id", Source: source, Sender: "alice"}, Status: status}}
+				_, command := model.Update(tuiKey("x"))
+				allowed := source == "tui" && status == "queued"
+				if command != nil || (model.retractingMessage != nil) != allowed || model.failed == allowed {
+					t.Fatal("incorrect retraction gating")
+				}
+			})
+		}
+	}
+}
+
+func TestTUIHistoryNavigationAndErrors(t *testing.T) {
+	for _, page := range []string{"inbox", "session"} {
+		t.Run(page, func(t *testing.T) {
+			fail := true
+			client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasSuffix(r.URL.Path, "/messages") {
+					if fail {
+						http.Error(w, "history unavailable", http.StatusServiceUnavailable)
+					} else {
+						io.WriteString(w, `[]`)
+					}
+				} else if strings.HasSuffix(r.URL.Path, "/status") {
+					io.WriteString(w, `{"status":"idle"}`)
+				} else {
+					io.WriteString(w, `{"messages":[]}`)
+				}
+			})
+			model := newTUI(t.Context(), client)
+			model.page, model.environment, model.agent, model.busy = page, "team", "worker", false
+			generation := model.sessionGeneration
+			_, load := model.Update(tuiKey("h"))
+			model.Update(load())
+			if !model.failed || !strings.Contains(model.status, "history unavailable") {
+				t.Fatal("history failure was hidden")
+			}
+			if _, stale := model.Update(tuiSessionTick(generation)); stale != nil {
+				t.Fatal("session polling continued in history")
+			}
+			fail = false
+			_, load = model.Update(tuiKey("r"))
+			model.Update(load())
+			if model.failed || !strings.Contains(model.View(), "No message history.") {
+				t.Fatal("history refresh failed")
+			}
+			if _, command := model.Update(tuiKey("x")); command != nil {
+				t.Fatal("empty history allowed retraction")
+			}
+			_, load = model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			if model.page != page || load == nil {
+				t.Fatal("history did not return to its origin")
+			}
+			_, tick := model.Update(load())
+			if page == "session" && tick == nil {
+				t.Fatal("session polling did not resume")
+			}
+		})
+	}
+}
+
+func TestTUISteeringMetadataAndSmallForms(t *testing.T) {
+	model := newTUI(t.Context(), nil)
+	model.page, model.agent, model.busy = "session", "worker", false
+	model.sessionMessages = []api.Message{{Role: "user", EnvelopeID: "incoming", Steer: "steering-target", RunID: "active-run", Content: "Change direction"}}
+	model.renderContent()
+	for _, text := range []string{"Steer: steering-target", "Run: active-run"} {
+		if !strings.Contains(model.View(), text) {
+			t.Fatalf("session missing %q", text)
+		}
+	}
+	model.page = "inbox"
+	model.Update(tuiResult{data: []byte(`{"messages":[{"ID":"queued","Steer":"steering-target","Content":"change"}]}`)})
+	if !strings.Contains(model.View(), "Steer: steering-target") {
+		t.Fatal("inbox missing steering target")
+	}
+	for _, size := range [][2]int{{40, 22}, {80, 24}, {120, 40}} {
+		model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+		model.openForm("message")
+		if len(model.inputs) != 4 || model.inputs[3].Value() != "" {
+			t.Fatal("steering field is not optional and blank")
+		}
+		model.text.SetValue("Readable content")
+		for index := 0; index < 4; index++ {
+			model.Update(tea.KeyMsg{Type: tea.KeyTab})
+		}
+		if model.focus != 4 || !model.text.Focused() {
+			t.Fatal("cannot reach message content")
+		}
+		view := ansi.Strip(model.View())
+		for _, label := range []string{"Sender", "Conversation ID", "Reply to", "Steer target (optional)", "Message to worker", "Readable content", "esc cancel"} {
+			if !strings.Contains(view, label) {
+				t.Fatalf("missing %q at %v:\n%s", label, size, view)
+			}
+		}
+		if lipgloss.Width(view) > size[0] || lipgloss.Height(view) > size[1] {
+			t.Fatalf("message form exceeds %v:\n%s", size, view)
+		}
+		if _, command := model.Update(tea.KeyMsg{Type: tea.KeyEsc}); command != nil || model.form != "" {
+			t.Fatal("cancel sent a message")
+		}
+		model.page = "history"
+		model.deliveries = []api.MessageDelivery{{Envelope: api.Envelope{ID: strings.Repeat("id", 60), Source: "tui", Sender: strings.Repeat("alice", 20), To: "worker"}, Status: "queued"}}
+		model.renderContent()
+		for _, confirm := range []bool{false, true} {
+			if confirm {
+				model.Update(tuiKey("x"))
+			}
+			view := ansi.Strip(model.View())
+			if lipgloss.Width(view) > size[0] || lipgloss.Height(view) > size[1] {
+				t.Fatalf("history/confirmation exceeds %v:\n%s", size, view)
+			}
+		}
+		model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+		model.page = "inbox"
+	}
+}
 func TestTUIDeleteAgent(t *testing.T) {
 	for _, test := range []struct {
 		name    string
@@ -650,16 +880,28 @@ func TestTUILiveSession(t *testing.T) {
 		{Role: "assistant", ToolCalls: []api.ToolCall{{ID: "call-1", Name: "get_time", Arguments: json.RawMessage(`{}`)}}},
 		{Role: "tool", ToolCallID: "call-1", Content: "12:00"},
 	}}
-	unavailable := false
+	requests := 0
 	client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/environments/team/agents/worker/status" {
+			io.WriteString(w, `{"status":"idle"}`)
+			return
+		}
 		if r.Method != http.MethodGet || r.URL.Path != "/environments/team/agents/worker/session" {
 			t.Errorf("unexpected session request: %s %s", r.Method, r.URL)
 		}
-		if unavailable {
+		requests++
+		messages := append([]api.Message{}, session.Messages...)
+		if requests >= 2 {
+			messages = append(messages, api.Message{Role: "assistant", Content: "First result"})
+		}
+		if requests >= 3 {
+			messages = append(messages, api.Message{Role: "assistant", Content: "Second result"})
+		}
+		if requests == 4 {
 			http.Error(w, "offline", http.StatusServiceUnavailable)
 			return
 		}
-		json.NewEncoder(w).Encode(session)
+		json.NewEncoder(w).Encode(api.Session{Messages: messages})
 	})
 	model := newTUI(t.Context(), client)
 	model.page, model.environment, model.busy = "agents", "team", false
@@ -668,34 +910,36 @@ func TestTUILiveSession(t *testing.T) {
 	if model.page != "session" || command == nil {
 		t.Fatal("session did not open")
 	}
-	_, tick := model.Update(command())
-	if tick == nil || !model.view.AtBottom() || !strings.Contains(model.detail, "Envelope: envelope-1") || !strings.Contains(model.View(), "Tool call: get_time [call-1]") || !strings.Contains(model.View(), "Tool result: call-1") {
+	_, next := model.Update(command())
+	t.Cleanup(model.stopSession)
+	if next == nil || !model.view.AtBottom() || !strings.Contains(model.detail, "Envelope: envelope-1") || !strings.Contains(model.View(), "Tool call: get_time [call-1]") || !strings.Contains(model.View(), "Tool result: call-1") {
 		t.Fatal("initial session is missing activity or does not follow the tail")
 	}
-	poll := func() {
+	read := func() {
 		t.Helper()
-		_, command := model.Update(tuiSessionTick(model.sessionGeneration))
-		if command == nil || model.busy {
-			t.Fatal("background poll is missing or blocks navigation")
+		if next == nil || model.busy {
+			t.Fatal("poll timer is missing or blocks navigation")
+		}
+		_, poll := model.Update(tuiSessionTick(model.sessionGeneration))
+		if poll == nil {
+			t.Fatal("timer did not request a snapshot")
 		}
 		_, duplicate := model.Update(tuiSessionTick(model.sessionGeneration))
 		if duplicate != nil {
-			t.Fatal("polls overlapped")
+			t.Fatal("duplicate timer scheduled an overlapping request")
 		}
-		_, next := model.Update(command())
-		if next == nil || model.sessionLoading {
+		_, next = model.Update(poll())
+		if next == nil {
 			t.Fatal("poll did not schedule its successor")
 		}
 	}
-	session.Messages = append(session.Messages, api.Message{Role: "assistant", Content: "First result"})
-	poll()
+	read()
 	if !model.view.AtBottom() || !strings.Contains(model.View(), "First result") {
 		t.Fatal("new result was not followed")
 	}
 	model.Update(tea.KeyMsg{Type: tea.KeyHome})
 	offset := model.view.YOffset
-	session.Messages = append(session.Messages, api.Message{Role: "assistant", Content: "Second result"})
-	poll()
+	read()
 	if model.view.YOffset != offset || model.view.AtBottom() || !strings.Contains(model.View(), "reading history") {
 		t.Fatal("poll moved the reader away from history")
 	}
@@ -703,15 +947,17 @@ func TestTUILiveSession(t *testing.T) {
 	if !model.view.AtBottom() || !strings.Contains(model.View(), "Second result") {
 		t.Fatal("End did not resume following")
 	}
-	unavailable = true
-	poll()
+	read()
 	if !model.failed || !strings.Contains(model.View(), "Second result") {
 		t.Fatal("failure discarded the last snapshot or was not shown")
 	}
-	unavailable = false
-	poll()
-	if model.failed || model.status != "" {
-		t.Fatal("polling did not recover from a failure")
+	if requests != 4 {
+		t.Fatal("unexpected number of snapshot requests")
+	}
+	_, reconnect := model.Update(tuiSessionTick(model.sessionGeneration))
+	model.Update(reconnect())
+	if model.failed || model.status != "" || requests != 5 || len(model.sessionMessages) != 5 {
+		t.Fatal("poll did not recover with a replacement snapshot")
 	}
 	for _, size := range [][2]int{{40, 22}, {80, 24}, {120, 40}} {
 		model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
@@ -793,7 +1039,9 @@ func TestTUISendFromSession(t *testing.T) {
 	client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method + " " + r.URL.Path {
 		case "GET /environments/team/agents/worker/session":
-			io.WriteString(w, `{"messages":[{"Role":"assistant","Content":"Previous answer"}]}`)
+			json.NewEncoder(w).Encode(api.Session{Messages: []api.Message{{Role: "assistant", Content: "Previous answer"}}})
+		case "GET /environments/team/agents/worker/status":
+			io.WriteString(w, `{"status":"idle"}`)
 		case "POST /environments/team/messages":
 			posts++
 			if reject {
@@ -812,6 +1060,7 @@ func TestTUISendFromSession(t *testing.T) {
 	model := newTUI(t.Context(), client)
 	model.page, model.environment, model.agent = "session", "team", "worker"
 	model.Update(model.refresh()())
+	t.Cleanup(model.stopSession)
 	oldGeneration := model.sessionGeneration
 	_, pending := model.Update(tuiSessionTick(oldGeneration))
 	lateResult := pending()
@@ -866,11 +1115,18 @@ func TestTUISendFromSession(t *testing.T) {
 }
 
 func TestTUISessionIgnoresStalePolls(t *testing.T) {
-	client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, `{"messages":[]}`) })
+	client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			io.WriteString(w, `{"status":"idle"}`)
+		} else {
+			io.WriteString(w, `{"messages":[]}`)
+		}
+	})
 	model := newTUI(t.Context(), client)
 	model.page, model.environment, model.agent, model.busy = "inbox", "team", "worker", false
 	_, command := model.Update(tuiKey("v"))
 	model.Update(command())
+	t.Cleanup(model.stopSession)
 	oldGeneration := model.sessionGeneration
 	_, pending := model.Update(tuiSessionTick(oldGeneration))
 	oldResult := pending()

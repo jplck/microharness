@@ -7,8 +7,8 @@ import (
 	"github.com/jplck/micro/toolplugin"
 )
 
-func main() {
-	tool := toolplugin.Tool{
+func echoTool() toolplugin.Tool {
+	return toolplugin.Tool{
 		Definition: toolplugin.Definition{
 			Name: "echo", Description: "Return the supplied text",
 			Parameters: []toolplugin.Parameter{{Name: "input", Type: toolplugin.String, Description: "Text to return", Required: true}},
@@ -19,7 +19,10 @@ func main() {
 			return arguments.Input, nil
 		}),
 	}
-	if err := toolplugin.Serve([]toolplugin.Tool{tool}); err != nil {
+}
+
+func main() {
+	if err := toolplugin.Serve([]toolplugin.Tool{echoTool()}); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
