@@ -30,6 +30,7 @@ type tuiResult struct {
 type tuiSessionTick uint64
 
 type tuiToolCatalogResult tuiResult
+type tuiAgentDeleteResult tuiResult
 
 type tuiSessionResult struct {
 	generation uint64
@@ -56,6 +57,8 @@ type tuiModel struct {
 	sessionMessages   []api.Message
 	form              string
 	editingAgent      string
+	deletingAgent     string
+	eraseAgentFiles   bool
 	labels            []string
 	inputs            []textinput.Model
 	text              textarea.Model
@@ -142,6 +145,14 @@ func (model tuiModel) sessionTick() tea.Cmd {
 
 func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch message := message.(type) {
+	case tuiAgentDeleteResult:
+		model.deletingAgent = ""
+		model.busy, model.failed = true, message.err != nil
+		model.status = "Agent deleted."
+		if message.err != nil {
+			model.status = message.err.Error()
+		}
+		return model, model.load()
 	case tuiToolCatalogResult:
 		model.busy = false
 		err := message.err
@@ -255,6 +266,27 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if model.busy {
 			return model, nil
 		}
+		if model.deletingAgent != "" {
+			switch key {
+			case "esc":
+				model.deletingAgent = ""
+			case "up", "k":
+				model.eraseAgentFiles = false
+			case "down", "j":
+				model.eraseAgentFiles = true
+			case " ":
+				model.eraseAgentFiles = !model.eraseAgentFiles
+			case "enter":
+				model.busy = true
+				path := agentPath(model.environment, model.deletingAgent)
+				if model.eraseAgentFiles {
+					path += "?erase_files=true"
+				}
+				request := model.request(http.MethodDelete, path, nil)
+				return model, func() tea.Msg { return tuiAgentDeleteResult(request().(tuiResult)) }
+			}
+			return model, nil
+		}
 		if model.form != "" {
 			return model.updateForm(message)
 		}
@@ -296,6 +328,13 @@ func (model *tuiModel) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 				model.agent = model.agents[model.cursor].Name
 				return model, model.openForm("edit-agent")
 			}
+		case "d":
+			if model.page == "agents" && len(model.agents) > 0 {
+				model.deletingAgent = model.agents[model.cursor].Name
+				model.eraseAgentFiles = false
+				model.status, model.failed = "", false
+			}
+			return model, nil
 		case "s":
 			if model.page == "agents" && len(model.agents) > 0 {
 				model.agent = model.agents[model.cursor].Name
@@ -745,15 +784,56 @@ func (model *tuiModel) renderContent() {
 	model.view.SetContent(lipgloss.NewStyle().Width(model.view.Width).Render(content.String()))
 }
 
-func (model tuiModel) renderToolPicker() string {
-	rows := 2
-	compact := model.childModelsVisible() && model.height < 26
-	if compact {
-		rows = 1
+func (model tuiModel) agentPickerRows() (tools, models int) {
+	// Reserve the outer chrome, input fields, instructions, and picker labels.
+	available := model.height - 9 - len(model.inputs)*2 - 1 - model.text.Height() - 2
+	if !model.childModelsVisible() || model.height >= 26 {
+		available-- // Tool description.
 	}
-	start := max(0, model.toolCursor-rows+1)
+	tools = 1
+	if model.childModelsVisible() {
+		available--
+		models = 1
+	}
+	for tools+models < available {
+		grew := false
+		if tools < len(model.toolChoices) {
+			tools++
+			grew = true
+		}
+		if models > 0 && models < len(model.childModelChoices) && tools+models < available {
+			models++
+			grew = true
+		}
+		if !grew {
+			break
+		}
+	}
+	return tools, models
+}
+
+func pickerWindow(cursor, rows, total int) (start, end int, indicator string) {
+	start = min(max(0, cursor-rows+1), max(0, total-rows))
+	end = min(total, start+rows)
+	directions := ""
+	if start > 0 {
+		directions += "^"
+	}
+	if end < total {
+		directions += "v"
+	}
+	if directions != "" {
+		indicator = " [more " + directions + "]"
+	}
+	return start, end, indicator
+}
+
+func (model tuiModel) renderToolPicker() string {
+	rows, _ := model.agentPickerRows()
+	compact := model.childModelsVisible() && model.height < 26
+	start, end, indicator := pickerWindow(model.toolCursor, rows, len(model.toolChoices))
 	var choices []string
-	for index := start; index < min(len(model.toolChoices), start+rows); index++ {
+	for index := start; index < end; index++ {
 		tool := model.toolChoices[index]
 		mark, grant, pointer := "[ ]", "[ ]", "  "
 		if model.selectedTools[tool.Name] {
@@ -785,21 +865,18 @@ func (model tuiModel) renderToolPicker() string {
 		description = terminalText(model.toolChoices[model.toolCursor].Description)
 	}
 	if compact {
-		return "  Use Assign Tool\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\nMemory + messaging: always enabled"
+		return "  Use Assign Tool" + indicator + "\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\nMemory + messaging: always enabled"
 	}
-	return "  Use Assign Tool\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\n" +
+	return "  Use Assign Tool" + indicator + "\n" + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n")) + "\n" +
 		lipgloss.NewStyle().Foreground(lipgloss.Color("244")).MaxWidth(model.width-4).MaxHeight(1).Render(description) + "\n" +
 		"Memory + messaging: always enabled"
 }
 
 func (model tuiModel) renderChildModelPicker() string {
-	rows := 1
-	if model.height >= 26 {
-		rows = 2
-	}
-	start := max(0, model.childModelCursor-rows+1)
+	_, rows := model.agentPickerRows()
+	start, end, indicator := pickerWindow(model.childModelCursor, rows, len(model.childModelChoices))
 	choices := []string{}
-	for index := start; index < min(len(model.childModelChoices), start+rows); index++ {
+	for index := start; index < end; index++ {
 		name := model.childModelChoices[index]
 		mark, pointer := "[ ]", "  "
 		if model.allowedModels[name] {
@@ -814,7 +891,7 @@ func (model tuiModel) renderChildModelPicker() string {
 	if len(choices) == 0 {
 		choices = append(choices, "No models configured.")
 	}
-	return fmt.Sprintf("Child models (%d selected)\n", len(selectedToolNames(model.allowedModels))) + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n"))
+	return fmt.Sprintf("Child models (%d selected)%s\n", len(selectedToolNames(model.allowedModels)), indicator) + lipgloss.NewStyle().Height(rows).Render(strings.Join(choices, "\n"))
 }
 
 func (model tuiModel) View() string {
@@ -831,7 +908,7 @@ func (model tuiModel) View() string {
 	body := model.view.View()
 	help := "up/down select | enter open | n new | m models | r refresh | esc back | q quit"
 	if model.page == "agents" {
-		help = "enter inbox | v session | n new | e edit agent | s message | r refresh | esc back | q quit"
+		help = "enter inbox | v session | n new | e edit | d delete | s message | r refresh | esc back | q quit"
 	}
 	if model.page == "inbox" {
 		help = "v session | s message | t retry | r refresh | up/down scroll | esc back | q quit"
@@ -872,8 +949,20 @@ func (model tuiModel) View() string {
 		body = form.String()
 		help = "tab/shift+tab field | ctrl+s submit | esc cancel | ctrl+c quit"
 		if model.toolPickerFocused() || model.childModelPickerFocused() {
-			help = "arrows select | space toggle | tab next | ctrl+s save | esc cancel"
+			help = "arrows scroll/select | space toggle | tab next | ctrl+s save | esc cancel"
 		}
+	}
+	if model.deletingAgent != "" {
+		title = "MICRO / DELETE AGENT"
+		keep, erase := "> [x] Keep files", "  [ ] Erase files permanently"
+		if model.eraseAgentFiles {
+			keep, erase = "  [ ] Keep files", "> [x] Erase files permanently"
+		}
+		name := lipgloss.NewStyle().MaxWidth(model.width - 4).MaxHeight(1).Render("Agent: " + terminalText(model.deletingAgent))
+		body = name + "\n\nQueued/paused work is discarded.\nRunning agents cannot be deleted.\n\n" +
+			"Conversation + private plugin files:\n" + keep + "\n" + erase +
+			"\n\nShared memory and other agents stay."
+		help = "up/down choose | enter delete | esc cancel"
 	}
 	status := terminalText(model.status)
 	if model.page == "session" && model.form == "" && status == "" {

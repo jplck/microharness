@@ -26,6 +26,16 @@ type ownedPlugin struct {
 	Binary *pluginBinary
 }
 
+func privatePluginPaths(root, saved string) (directory, executable string, err error) {
+	parts := strings.Split(saved, "/")
+	if len(parts) != 3 || !validStateName.MatchString(parts[0]) ||
+		parts[1] != "bin" || !pluginToolName.MatchString(parts[2]) {
+		return "", "", fmt.Errorf("invalid saved plugin path %q", saved)
+	}
+	directory = filepath.Join(root, "plugins", parts[0])
+	return directory, filepath.Join(directory, "bin", parts[2]), nil
+}
+
 func buildPlugin(ctx context.Context, directory, source string) error {
 	if err := os.MkdirAll(filepath.Join(directory, "toolplugin"), 0700); err != nil {
 		return err
@@ -82,7 +92,7 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 		return err
 	}
 	env.mu.Lock()
-	_, err := env.pluginOwnerLocked(caller, request.Name)
+	owner, err := env.pluginOwnerLocked(caller, request.Name)
 	root := filepath.Join(env.DataRoot, "plugins")
 	env.mu.Unlock()
 	if err != nil {
@@ -126,7 +136,16 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 	if err != nil {
 		return err
 	}
-	name := caller + "-" + rand.Text()
+	if agent != owner {
+		return ErrAgentNotFound
+	}
+	if err := os.Mkdir(filepath.Join(directory, "bin"), 0700); err != nil {
+		return err
+	}
+	if err := os.Rename(filepath.Join(directory, "tool"), filepath.Join(directory, "bin", request.Name)); err != nil {
+		return err
+	}
+	name := caller + "-" + request.Name + "-" + rand.Text()
 	final, err := filepath.Abs(filepath.Join(root, name))
 	if err != nil {
 		return err
@@ -134,9 +153,9 @@ func (env *AgentEnvironment) CreatePlugin(ctx context.Context, caller string, re
 	if err := os.Rename(directory, final); err != nil {
 		return err
 	}
-	binary.Path = filepath.Join(final, "tool")
+	binary.Path = filepath.Join(final, "bin", request.Name)
 	previous := agent.plugins
-	agent.plugins = append(agent.plugins, ownedPlugin{Path: name, Binary: binary})
+	agent.plugins = append(agent.plugins, ownedPlugin{Path: name + "/bin/" + request.Name, Binary: binary})
 	if err := env.saveLocked(); err != nil {
 		agent.plugins = previous
 		os.RemoveAll(final)

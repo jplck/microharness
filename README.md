@@ -36,9 +36,19 @@ socket, pass `--socket /path/to/micro.sock` to both commands.
   to toggle each permitted model. This list is separate from the agent's own
   model; selecting none blocks child creation. Small terminals show fewer rows
   and omit tool descriptions while this checklist is visible.
+  Both checklists expand with the terminal height. A `[more v]`, `[more ^]`,
+  or `[more ^v]` label indicates hidden rows below, above, or in both directions;
+  focus the list with Tab and use Up/Down to scroll.
   Changes are persisted and require an idle agent with an empty inbox, including
   no paused work. The name is fixed and session history is preserved; editing
   instructions updates the session's system prompt.
+- Press `d` on the agent list to delete the selected agent. Choose whether to
+  keep its saved conversation and private plugin files (the default) or erase
+  them permanently, then press Enter to confirm or Esc to cancel.
+  Queued and paused work is discarded; running agents cannot be deleted.
+  Shared memory and other agents are untouched. If the default recipient is
+  deleted, the first remaining agent becomes the default.
+  Retained files stay on disk but are no longer listed in the TUI.
 - Press `s` on an agent, its inbox, or its live session to compose a message, including optional
   conversation and reply IDs.
 - Press `v` on an agent or its inbox to open its live session: messages, tool
@@ -150,9 +160,9 @@ All assignable tools must also be in the registry used to restore the environmen
 ## Tool architecture
 
 Built-in memory, messaging, agent creation, time, and tool creation run as native
-Go handlers inside the runtime. External and agent-created tools still execute
-as binary plugins using the version-1 `describe`/`call` contract. There is no Go
-`.so` loading or Python runner.
+Go handlers inside the runtime. Only agent-created tools execute as binary
+plugins using the version-1 `describe`/`call` contract. There is no external
+plugin directory, Go `.so` loading, or Python runner.
 
 - [toolplugin/plugin.go](toolplugin/plugin.go) is the stdlib-only SDK and the
   authoritative version-1 wire contract: `Definition`, `Parameter`, `Manifest`,
@@ -164,8 +174,8 @@ as binary plugins using the version-1 `describe`/`call` contract. There is no Go
 - [api/plugins.go](api/plugins.go) contains the central subprocess launcher for
   plugin builds, discovery, and calls. Agent state,
   queues, memory, persistence, and authorization remain in the runtime.
-- [api/plugin_catalog.go](api/plugin_catalog.go) validates manifests and takes
-  immutable executable snapshots. [api/tool_catalog.go](api/tool_catalog.go)
+- [api/plugin_catalog.go](api/plugin_catalog.go) validates private plugin
+  manifests. [api/tool_catalog.go](api/tool_catalog.go)
   retains Use/Assign selection and caller binding. Tools are refreshed before
   each invocation and model call, without changing an agent's grants.
 
@@ -208,42 +218,12 @@ classification behavior.
 Stdout is protocol-only; diagnostics belong on stderr. There is no streaming,
 long-lived plugin process, or plugin-selected caller identity.
 
-Names match `[a-z][a-z0-9_]{0,63}`. A manifest contains 1-64 distinct tools with
+Names match `[a-z][a-z0-9_]{0,63}`. An agent-created plugin exposes exactly one tool with
 nonempty descriptions (max 8192 bytes). Parameters use `string`, `integer`,
 `number`, `boolean`, or `array` with primitive `items`. `enum` is supported for
 strings. Nested object schemas are not supported in this version. Plugins cannot
-declare `automatic: true` or replace a native built-in. Duplicate names reject
-discovery.
-
-## Install and reload
-
-Build binaries for the runtime's OS and architecture. For the example:
-
-```sh
-go build -o plugins/bin/.echo-new ./examples/echo
-mv plugins/bin/.echo-new plugins/bin/echo
-go run main.go plugins reload
-```
-
-The runtime scans `plugins/bin` at startup; `serve --plugins <directory>` changes
-the external-plugin directory. An absent or empty directory leaves native
-built-ins available. Hidden files and directories are ignored. Other
-entries must be executable regular files. Build to a hidden temporary filename
-and rename into place, never overwrite a live executable in place.
-
-When upgrading from binary-backed built-ins, remove the old `plugins/bin/builtin`
-executable (or move it outside the scanned directory). Its definitions are now
-reserved native tools. `MICRO_BUILTIN_PLUGIN` is no longer used.
-
-Reload is also available as `POST /tools/reload`. It reloads external plugins,
-not native implementations. It validates the whole candidate catalogue before
-publishing it; failures preserve the active catalogue. New
-tools appear in the agent form's Use/Assign picker when reopened, but are never
-automatically granted. Replacements apply to subsequent calls; invocations
-already holding a snapshot keep the old binary. Snapshots are retained until
-runtime shutdown. Removing a binary and reloading removes its tools from calls
-without erasing grants. Before restarting, restore missing binaries or remove
-their grants: startup fails if saved agents require absent registered tools.
+declare `automatic: true` or replace a native built-in. Names must be unique
+within the creating agent; different agents may create tools with the same name.
 
 ## Agent-created plugins
 
@@ -257,9 +237,20 @@ module downloads, CGO, workspace overrides, and automatic toolchain downloads
 are disabled. A local Go 1.25+ toolchain is required for creation.
 
 The creating agent can invoke its tool immediately, even in the same tool-call
-batch. Definitions, source, and binaries persist under the environment's
-`plugins` directory. Saved agent state references the installed directory;
-startup runs `describe`, not the sample call, to restore its schema. Missing or
+batch. Source and binaries persist under the environment's `plugins` directory:
+
+```text
+data/<environment>/plugins/<agent>-<tool-name>-<unique-id>/
+  bin/<tool-name>
+  main.go
+  go.mod
+  toolplugin/plugin.go
+```
+
+For example, `seattle_time` is the executable's filename, not the generic `tool`.
+The agent prefix and unique ID prevent collisions between agents or retained
+files from deleted agents. Saved agent state references the relative executable
+path. Startup runs `describe`, not the sample call, to restore its schema. Missing or
 invalid private binaries fail restoration. Tools remain private and cannot be
 assigned to children. Editing an agent preserves them; unchecking Use for
 `create_tool` disables both creation and use of its private plugins. Re-enabling
@@ -267,11 +258,18 @@ it restores access. Individual replacement, deletion, and sharing of private
 plugins are not implemented. Failed samples and failed state saves do not
 register a tool, though any effects of executing the sample cannot be undone.
 
+Only the named layout above is supported; older directory-only references are
+not migrated or loaded.
+External plugin scanning, `serve --plugins`, `plugins reload`, and
+`POST /tools/reload` are no longer supported. Remove the flag from launch commands;
+the global Use/Assign catalogue contains only native tools. Saved agents with
+old external-tool grants must have those grants removed before startup.
+
 ## Execution and sandboxing
 
 **Plugins are not sandboxed yet.** Discovery, compilation, sample tests, and
 normal calls execute with the runtime user's OS access. Grant creation only to
-trusted agents and install only trusted binaries. A restricted environment and
+trusted agents. A restricted environment and
 temporary working directory are not security boundaries; plugins can access
 files, networks, and processes, including secrets on disk.
 
@@ -340,10 +338,12 @@ start workers. Submit `env.Message(ctx, api.Envelope{...})`, inspect with
 `env.Inbox(name)` or `env.Status(name)`, and use `env.RetryInbox(ctx, name)` for paused work. Call
 `env.Close()` to cancel workers, preserve unfinished messages, and wait for them
 to exit.
+Use `env.DeleteAgent(ctx, name, eraseFiles)` to remove a non-running agent and
+discard its inbox, optionally erasing its saved conversation and private plugins.
 
 The Unix-socket API exposes:
 
-- `GET /tools`: registered optional tool names and descriptions.
+- `GET /tools`: native optional tool names and descriptions, excluding private plugins.
 - `POST /environments/{id}/agents/{name}?model=...&tool=get_time`: create an
   agent with optional repeated `tool` (Use) and `assignable_tool` (Assign)
   query parameters, repeated `allowed_model` child-model permissions, and `instructions`.
@@ -357,6 +357,13 @@ The Unix-socket API exposes:
   with a JSON array of registered names, such as `["get_time"]` or `[]`.
   This changes only Use permissions and preserves Assign and child-model permissions.
   Returns 204 on success, 400 for invalid tools, or 409 when the agent is busy.
+- `DELETE /environments/{id}/agents/{name}`: remove an agent and discard queued
+  or paused work. Saved conversation/private plugin files are retained unless
+  `?erase_files=true` is supplied. Shared memory and other agents are preserved.
+  Deleting the default recipient promotes the first remaining agent, or clears
+  the default if none remain. Returns 204 on success, 404 if absent, or 409 while
+  running. A file-cleanup failure returns 500 with an explicit warning that the
+  agent was deleted but some files remain; the deletion itself stays committed.
 - `GET /environments/{id}/agents`: agent names, models, custom instructions,
   optional `tools`, `assignable_tools`, `allowed_models`, processing `status`,
   `active_envelope_id` when running, pending-message counts, and any inbox error.

@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 )
 
 var ErrInvalidTool = errors.New("invalid or duplicate tool")
 var ErrAgentBusy = errors.New("agent must be idle before editing")
+var ErrAgentRunning = errors.New("cannot delete a running agent")
+var ErrAgentDataCleanup = errors.New("agent deleted, but some saved files could not be erased")
 
 type Envelope struct {
 	ID             string
@@ -29,6 +33,7 @@ type Agent struct {
 	plugins             []ownedPlugin
 	runMu               sync.Mutex
 	inboxWake           chan struct{}
+	workerCancel        context.CancelFunc
 	Client              ModelCall
 	Tools               []Tool
 	ToolNames           []string
@@ -106,6 +111,9 @@ func (env *AgentEnvironment) SetAgentTools(ctx context.Context, name string, too
 	defer agent.runMu.Unlock()
 	env.mu.Lock()
 	defer env.mu.Unlock()
+	if env.agentLocked(name) != agent {
+		return ErrAgentNotFound
+	}
 	if env.closed {
 		return ErrEnvironmentClosed
 	}
@@ -149,6 +157,9 @@ func (env *AgentEnvironment) UpdateAgentWithModels(ctx context.Context, name, mo
 	defer agent.runMu.Unlock()
 	env.mu.Lock()
 	defer env.mu.Unlock()
+	if env.agentLocked(name) != agent {
+		return ErrAgentNotFound
+	}
 	if env.closed {
 		return ErrEnvironmentClosed
 	}
@@ -207,6 +218,74 @@ func (env *AgentEnvironment) UpdateAgentWithModels(ctx context.Context, name, mo
 			err = errors.Join(err, previousSession.persist())
 		}
 		return fmt.Errorf("save agent update: %w", err)
+	}
+	return nil
+}
+
+func (env *AgentEnvironment) DeleteAgent(ctx context.Context, name string, eraseFiles bool) error {
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	if env.closed {
+		return ErrEnvironmentClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	agent := env.agentLocked(name)
+	if agent == nil {
+		return ErrAgentNotFound
+	}
+	if agent.activeEnvelopeID != "" || !agent.runMu.TryLock() {
+		return ErrAgentRunning
+	}
+	defer agent.runMu.Unlock()
+
+	var sessionPath string
+	var pluginPaths []string
+	if eraseFiles {
+		var err error
+		sessionPath, err = agent.Session.path()
+		if err != nil {
+			return err
+		}
+		for _, plugin := range agent.plugins {
+			directory, _, err := privatePluginPaths(env.DataRoot, plugin.Path)
+			if err != nil {
+				return err
+			}
+			pluginPaths = append(pluginPaths, directory)
+		}
+	}
+
+	previousAgents, previousInitial := env.Agents, env.InitialAgent
+	index := slices.Index(env.Agents, agent)
+	env.Agents = slices.Delete(slices.Clone(env.Agents), index, index+1)
+	if env.InitialAgent == agent {
+		env.InitialAgent = nil
+		if len(env.Agents) > 0 {
+			env.InitialAgent = env.Agents[0]
+		}
+	}
+	if err := env.saveLocked(); err != nil {
+		env.Agents, env.InitialAgent = previousAgents, previousInitial
+		return fmt.Errorf("save agent deletion: %w", err)
+	}
+	if agent.workerCancel != nil {
+		agent.workerCancel()
+	}
+	if eraseFiles {
+		var cleanupErr error
+		if err := os.Remove(sessionPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+		for _, path := range pluginPaths {
+			if err := os.RemoveAll(path); err != nil {
+				cleanupErr = errors.Join(cleanupErr, err)
+			}
+		}
+		if cleanupErr != nil {
+			return fmt.Errorf("%w: %w", ErrAgentDataCleanup, cleanupErr)
+		}
 	}
 	return nil
 }
@@ -304,6 +383,12 @@ func (env *AgentEnvironment) createAgent(ctx context.Context, modelName string, 
 func (a *Agent) executeEnvelope(ctx context.Context, envelope Envelope) error {
 	a.runMu.Lock()
 	defer a.runMu.Unlock()
+	a.environment.mu.Lock()
+	exists := a.environment.agentLocked(a.Name) == a
+	a.environment.mu.Unlock()
+	if !exists {
+		return ErrAgentNotFound
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}

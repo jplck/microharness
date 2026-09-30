@@ -205,8 +205,10 @@ func (env *AgentEnvironment) Close() {
 
 func (env *AgentEnvironment) startWorkerLocked(agent *Agent) {
 	agent.inboxWake = make(chan struct{}, 1)
+	ctx, cancel := context.WithCancel(env.workerCtx)
+	agent.workerCancel = cancel
 	env.workerWG.Add(1)
-	go env.runInbox(env.workerCtx, agent)
+	go env.runInbox(ctx, agent)
 	env.notifyLocked(agent)
 }
 

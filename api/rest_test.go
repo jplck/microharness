@@ -3,11 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -189,6 +191,12 @@ func TestRuntimeRestoresEnvironments(t *testing.T) {
 func TestRuntimeToolSelection(t *testing.T) {
 	ctx, root, _ := setupPersistenceTest(t)
 	t.Setenv("PATH", t.TempDir())
+	if err := os.MkdirAll("plugins/bin", 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("plugins/bin/ignored", []byte("not an executable"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := writeJSONAtomic("models.json", map[string]any{"models": []Model{{Name: "test-model", Provider: ProviderOpenAI}, {Name: "other-model", Provider: ProviderOpenAI}}}); err != nil {
 		t.Fatal(err)
 	}
@@ -215,7 +223,7 @@ func TestRuntimeToolSelection(t *testing.T) {
 		t.Fatalf("tool catalog: %+v %v", catalog, err)
 	}
 	request("POST", "/environments/tools", "", 201)
-	request("POST", "/tools/reload", "", 200)
+	request("POST", "/tools/reload", "", 404)
 	for _, query := range []string{"tool=missing", "tool=get_time&tool=get_time", "tool=message", "assignable_tool=missing", "assignable_tool=get_time&assignable_tool=get_time", "assignable_tool=message", "allowed_model=missing", "allowed_model=test-model&allowed_model=test-model"} {
 		request("POST", "/environments/tools/agents/assistant?model=test-model&"+query, "", 400)
 	}
@@ -279,6 +287,78 @@ func TestRuntimeToolSelection(t *testing.T) {
 	}
 	if loaded.Agents[0].ModelName != "other-model" || loaded.Agents[0].Instructions != instructions || loaded.Agents[0].Session.Messages[0].Content != agentInstructions(instructions) {
 		t.Fatal("agent edit did not survive restart")
+	}
+}
+
+func TestRuntimeDeleteAgent(t *testing.T) {
+	ctx, root, _ := setupPersistenceTest(t)
+	env, err := NewAgentEnvironment(ctx, root, "team")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := env.CreateAgent(ctx, "test-model", nil, "first", "", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := env.CreateAgent(ctx, "test-model", nil, "second", "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first.Inbox, first.InboxError = []Envelope{{ID: "pending"}}, "paused"
+	if err := env.saveLocked(); err != nil {
+		t.Fatal(err)
+	}
+	firstPath, err := first.Session.path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondPath, err := second.Session.path()
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, stop := startTestRuntime(t, root)
+	request := func(method, path string, status int) []byte {
+		t.Helper()
+		req, err := http.NewRequest(method, "http://localhost"+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := client.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		data, err := io.ReadAll(response.Body)
+		if err != nil || response.StatusCode != status {
+			t.Fatalf("%s %s: %s %s %v", method, path, response.Status, data, err)
+		}
+		return data
+	}
+	request(http.MethodDelete, "/environments/missing/agents/first", http.StatusNotFound)
+	request(http.MethodDelete, "/environments/team/agents/missing", http.StatusNotFound)
+	for _, query := range []string{"erase_files=", "erase_files=yes", "erase_files=true&erase_files=false"} {
+		request(http.MethodDelete, "/environments/team/agents/first?"+query, http.StatusBadRequest)
+	}
+	request(http.MethodDelete, "/environments/team/agents/first", http.StatusNoContent)
+	for _, suffix := range []string{"/status", "/inbox", "/session"} {
+		request(http.MethodGet, "/environments/team/agents/first"+suffix, http.StatusNotFound)
+	}
+	request(http.MethodDelete, "/environments/team/agents/first", http.StatusNotFound)
+	var agents []AgentSummary
+	if err := json.Unmarshal(request(http.MethodGet, "/environments/team/agents", http.StatusOK), &agents); err != nil || len(agents) != 1 || agents[0].Name != "second" {
+		t.Fatal("deleted agent still listed:", err)
+	}
+	request(http.MethodDelete, "/environments/team/agents/second?erase_files=true", http.StatusNoContent)
+	if _, err := os.Stat(firstPath); err != nil {
+		t.Fatal("retained conversation was erased:", err)
+	}
+	if _, err := os.Stat(secondPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("conversation was not erased:", err)
+	}
+	stop()
+	client, _ = startTestRuntime(t, root)
+	if err := json.Unmarshal(request(http.MethodGet, "/environments/team/agents", http.StatusOK), &agents); err != nil || len(agents) != 0 {
+		t.Fatal("deleted agents returned after runtime restart:", err)
 	}
 }
 
@@ -411,6 +491,7 @@ func TestRuntimeMessagingAPI(t *testing.T) {
 	if snapshot.Messages[len(snapshot.Messages)-1].EnvelopeID != receipt["id"] {
 		t.Fatal("active session snapshot is missing the in-progress envelope")
 	}
+	request(http.MethodDelete, "/environments/mail/agents/recipient?erase_files=true", "", http.StatusConflict)
 	close(releaseModel)
 	waitInbox(func(inbox InboxState) bool {
 		return len(inbox.Messages) == 0 && inbox.Error == "" && inbox.Status == "idle"

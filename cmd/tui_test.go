@@ -3,6 +3,7 @@ package cmd
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
@@ -113,6 +115,118 @@ func TestTUICreateAgentAndMessage(t *testing.T) {
 	}
 	if !strings.Contains(model.status, "envelope-1") {
 		t.Fatal("missing delivery receipt")
+	}
+}
+
+func TestTUIDeleteAgent(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		erase   bool
+		status  int
+		message string
+		removed bool
+	}{
+		{"keep files", false, http.StatusNoContent, "", true},
+		{"erase files", true, http.StatusNoContent, "", true},
+		{"running", true, http.StatusConflict, "cannot delete a running agent", false},
+		{"cleanup failure", true, http.StatusInternalServerError, "agent deleted, but some saved files could not be erased", true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			agents := []api.AgentSummary{{Name: "first"}, {Name: "worker", Pending: 2, Status: "paused"}}
+			deletes, loads := 0, 0
+			client := tuiTestClient(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Method == http.MethodDelete && r.URL.Path == "/environments/team/agents/worker":
+					deletes++
+					if (r.URL.Query().Get("erase_files") == "true") != test.erase {
+						t.Error("incorrect file-erasure choice")
+					}
+					if test.removed {
+						agents = agents[:1]
+					}
+					if test.status != http.StatusNoContent {
+						http.Error(w, test.message, test.status)
+					} else {
+						w.WriteHeader(http.StatusNoContent)
+					}
+				case r.Method == http.MethodGet && r.URL.Path == "/environments/team/agents":
+					loads++
+					json.NewEncoder(w).Encode(agents)
+				default:
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusNotFound)
+				}
+			})
+			model := newTUI(t.Context(), client)
+			model.page, model.environment, model.busy = "agents", "team", false
+			model.agents, model.cursor = agents, 1
+			if _, command := model.Update(tuiKey("d")); command != nil || model.deletingAgent != "worker" || model.eraseAgentFiles {
+				t.Fatal("delete did not open a keep-files confirmation")
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyDown})
+			model.Update(tea.KeyMsg{Type: tea.KeyEsc})
+			if model.deletingAgent != "" || deletes != 0 {
+				t.Fatal("cancel deleted the agent")
+			}
+			model.Update(tuiKey("d"))
+			if model.eraseAgentFiles {
+				t.Fatal("file-erasure choice was not reset to the safe default")
+			}
+			for _, size := range [][2]int{{40, 22}, {80, 24}, {120, 40}} {
+				model.Update(tea.WindowSizeMsg{Width: size[0], Height: size[1]})
+				view := ansi.Strip(model.View())
+				for _, label := range []string{"DELETE AGENT", "Agent: worker", "> [x] Keep files", "Erase files permanently", "Queued/paused work is discarded.", "enter delete", "esc cancel"} {
+					if !strings.Contains(strings.Join(strings.Fields(view), " "), label) {
+						t.Fatalf("missing confirmation label %q at %v:\n%s", label, size, view)
+					}
+				}
+				if lipgloss.Height(view) > size[1] || lipgloss.Width(view) > size[0] {
+					t.Fatalf("confirmation exceeds terminal bounds at %v:\n%s", size, view)
+				}
+			}
+			model.Update(tea.KeyMsg{Type: tea.KeyDown})
+			model.Update(tea.KeyMsg{Type: tea.KeyUp})
+			if model.eraseAgentFiles {
+				t.Fatal("up did not select keep files")
+			}
+			if test.erase {
+				model.Update(tuiKey(" "))
+				if !strings.Contains(ansi.Strip(model.View()), "> [x] Erase files permanently") {
+					t.Fatal("erase selection not visible")
+				}
+			}
+			for _, key := range []tea.KeyMsg{tuiKey("d"), tuiKey("n"), {Type: tea.KeyCtrlS}} {
+				if _, command := model.Update(key); command != nil {
+					t.Fatal("unconfirmed deletion submitted")
+				}
+			}
+			_, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+			if command == nil || !model.busy || deletes != 0 {
+				t.Fatal("confirmation did not schedule deletion")
+			}
+			if _, duplicate := model.Update(tea.KeyMsg{Type: tea.KeyEnter}); duplicate != nil {
+				t.Fatal("repeated confirmation submitted twice")
+			}
+			_, reload := model.Update(command())
+			if reload == nil || model.deletingAgent != "" {
+				t.Fatal("deletion did not close confirmation and refresh")
+			}
+			model.Update(reload())
+			if deletes != 1 || loads != 1 || model.busy || model.failed != (test.status != http.StatusNoContent) {
+				t.Fatal("incorrect deletion result state")
+			}
+			if len(model.agents) != len(agents) || model.cursor >= len(agents) {
+				t.Fatal("list or selection was not refreshed")
+			}
+			if test.message != "" && !strings.Contains(model.status, test.message) {
+				t.Fatal("deletion error was hidden:", model.status)
+			}
+		})
+	}
+	model := newTUI(t.Context(), nil)
+	model.page, model.busy = "agents", false
+	if _, command := model.Update(tuiKey("d")); command != nil || model.deletingAgent != "" {
+		t.Fatal("empty agent list allowed deletion")
 	}
 }
 
@@ -415,6 +529,118 @@ func TestTUIToolPickerBoundsAndEmptyCatalog(t *testing.T) {
 	model.Update(tuiToolCatalogResult{err: errors.New("offline")})
 	if model.form != "" || !model.failed || model.busy {
 		t.Fatal("catalog failure left editable blank tools")
+	}
+}
+
+func TestTUIAgentPickerHeightAndScrollIndicators(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("models.json", []byte(`{"models":[{"name":"test","provider":"openai"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, form := range []string{"agent", "edit-agent"} {
+		for _, size := range []struct {
+			width, height, tools, childTools, childModels int
+		}{
+			{40, 22, 2, 1, 1},
+			{80, 24, 4, 2, 2},
+			{40, 26, 6, 3, 2},
+			{120, 40, 20, 10, 9},
+		} {
+			for _, children := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%dx%d/children=%t", form, size.width, size.height, children), func(t *testing.T) {
+					model := newTUI(t.Context(), nil)
+					model.page = "agents"
+					model.agents = []api.AgentSummary{{Name: "worker", Model: "test"}}
+					model.openForm(form)
+					model.Update(tuiToolCatalogResult{data: []byte(`[]`)})
+					model.childModelChoices = nil
+					for i := range 20 {
+						model.toolChoices = append(model.toolChoices, api.ToolSummary{Name: fmt.Sprintf("tool-%02d", i)})
+						model.childModelChoices = append(model.childModelChoices, fmt.Sprintf("child-%02d", i))
+					}
+					model.selectedTools["create_agent"] = children
+					model.Update(tea.WindowSizeMsg{Width: size.width, Height: size.height})
+					wantTools, wantModels := size.tools, 0
+					if children {
+						wantTools, wantModels = size.childTools, size.childModels
+					}
+					if tools, models := model.agentPickerRows(); tools != wantTools || models != wantModels {
+						t.Fatalf("rows = %d, %d; want %d, %d", tools, models, wantTools, wantModels)
+					}
+					for _, cursor := range []int{0, 10, 19} {
+						model.toolCursor, model.childModelCursor = cursor, cursor
+						model.focus = len(model.inputs) + 1
+						view := ansi.Strip(model.View())
+						if got := strings.Count(view, "[ ] [ ]    tool-"); got != wantTools {
+							t.Fatalf("visible tools = %d; want %d:\n%s", got, wantTools, view)
+						}
+						if got := strings.Count(view, "[ ] child-"); got != wantModels {
+							t.Fatalf("visible models = %d; want %d:\n%s", got, wantModels, view)
+						}
+						if !strings.Contains(view, fmt.Sprintf("> [ ] [ ]    tool-%02d", cursor)) {
+							t.Fatalf("selected tool not visible:\n%s", view)
+						}
+						if children {
+							model.focus++
+							view = ansi.Strip(model.View())
+							if !strings.Contains(view, fmt.Sprintf("> [ ] child-%02d", cursor)) {
+								t.Fatalf("selected child model not visible:\n%s", view)
+							}
+						}
+						for _, picker := range []struct {
+							header string
+							rows   int
+							view   string
+						}{{"  Use Assign Tool", wantTools, model.renderToolPicker()}, {"Child models (0 selected)", wantModels, model.renderChildModelPicker()}} {
+							if picker.rows == 0 {
+								continue
+							}
+							indicator := ""
+							if picker.rows < 20 {
+								switch cursor {
+								case 0:
+									indicator = " [more v]"
+								case 10:
+									indicator = " [more ^v]"
+								case 19:
+									indicator = " [more ^]"
+								}
+							}
+							if !strings.HasPrefix(picker.view, picker.header+indicator+"\n") {
+								t.Fatalf("missing picker indicator %q:\n%s", picker.header+indicator, view)
+							}
+						}
+						if !strings.Contains(view, "always enabled") || !strings.Contains(view, "ctrl+s save") {
+							t.Fatalf("footer clipped:\n%s", view)
+						}
+						if lipgloss.Height(view) > size.height || lipgloss.Width(view) > size.width {
+							t.Fatalf("form exceeds terminal bounds:\n%s", view)
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestTUIAgentPickerSharesUnusedRows(t *testing.T) {
+	model := newTUI(t.Context(), nil)
+	model.form, model.height = "agent", 40
+	model.text.SetHeight(3)
+	model.inputs = make([]textinput.Model, 2)
+	model.selectedTools = map[string]bool{"create_agent": true}
+	for _, counts := range []struct{ tools, models, wantTools, wantModels int }{
+		{3, 20, 3, 16},
+		{20, 2, 17, 2},
+		{3, 2, 3, 2},
+		{0, 0, 1, 1},
+	} {
+		model.toolChoices = make([]api.ToolSummary, counts.tools)
+		model.childModelChoices = make([]string, counts.models)
+		if tools, models := model.agentPickerRows(); tools != counts.wantTools || models != counts.wantModels {
+			t.Errorf("catalog sizes %d, %d: rows = %d, %d; want %d, %d",
+				counts.tools, counts.models, tools, models, counts.wantTools, counts.wantModels)
+		}
 	}
 }
 

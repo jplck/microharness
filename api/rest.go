@@ -16,57 +16,15 @@ import (
 	"time"
 )
 
-func ServeRuntime(ctx context.Context, socketPath, dataRoot string, pluginDirectories ...string) error {
+func ServeRuntime(ctx context.Context, socketPath, dataRoot string) error {
 	var mu sync.Mutex
-	pluginDirectory := "plugins/bin"
-	if len(pluginDirectories) > 0 {
-		pluginDirectory = pluginDirectories[0]
-	}
-	registry, cache, err := loadPluginCatalogue(ctx, pluginDirectory)
-	if err != nil {
-		return err
-	}
-	caches := []string{cache}
-	defer func() {
-		for _, directory := range caches {
-			os.RemoveAll(directory)
-		}
-	}()
+	registry := DefaultTools()
 	environments, err := loadAgentEnvironments(ctx, dataRoot, registry)
 	if err != nil {
 		return err
 	}
 	mux := http.NewServeMux()
-	currentRegistry := func() ToolRegistry { mu.Lock(); defer mu.Unlock(); return registry }
 	mux.HandleFunc("GET /tools", func(w http.ResponseWriter, r *http.Request) {
-		writeJSONResponse(w, http.StatusOK, currentRegistry().Optional())
-	})
-	mux.HandleFunc("POST /tools/reload", func(w http.ResponseWriter, r *http.Request) {
-		replacement, directory, err := loadPluginCatalogue(r.Context(), pluginDirectory)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		for _, env := range environments {
-			env.mu.Lock()
-			defer env.mu.Unlock()
-		}
-		for _, env := range environments {
-			for _, agent := range env.Agents {
-				if err := checkPrivatePluginNames(agent, replacement); err != nil {
-					os.RemoveAll(directory)
-					http.Error(w, err.Error(), http.StatusConflict)
-					return
-				}
-			}
-		}
-		for _, env := range environments {
-			env.registry = replacement
-		}
-		registry = replacement
-		caches = append(caches, directory)
 		writeJSONResponse(w, http.StatusOK, registry.Optional())
 	})
 	handleEnvironment := func(pattern string, handler func(http.ResponseWriter, *http.Request, *AgentEnvironment)) {
@@ -145,8 +103,9 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string, pluginDirect
 			return
 		}
 		snapshot := Session{SessionID: agent.Session.SessionID, Scope: agent.Session.Scope}
+		err := snapshot.Load()
 		env.mu.Unlock()
-		if err := snapshot.Load(); err != nil {
+		if err != nil {
 			log.Printf("session snapshot failed: %v", err)
 			http.Error(w, "cannot read session", http.StatusInternalServerError)
 			return
@@ -160,16 +119,29 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string, pluginDirect
 		}
 		w.WriteHeader(http.StatusAccepted)
 	})
+	handleEnvironment("DELETE /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
+		values := r.URL.Query()["erase_files"]
+		if len(values) > 1 || len(values) == 1 && values[0] != "true" && values[0] != "false" {
+			http.Error(w, "erase_files must be true or false", http.StatusBadRequest)
+			return
+		}
+		eraseFiles := len(values) == 1 && values[0] == "true"
+		if err := env.DeleteAgent(r.Context(), r.PathValue("name"), eraseFiles); err != nil {
+			writeMessagingError(w, err)
+			return
+		}
+		log.Printf("agent deleted: environment=%s name=%s erase_files=%t", r.PathValue("id"), r.PathValue("name"), eraseFiles)
+		w.WriteHeader(http.StatusNoContent)
+	})
 	for _, method := range []string{http.MethodPost, http.MethodPut} {
 		handleEnvironment(method+" /environments/{id}/agents/{name}", func(w http.ResponseWriter, r *http.Request, env *AgentEnvironment) {
 			name := r.PathValue("name")
-			snapshot := currentRegistry()
-			tools, err := snapshot.Resolve(r.URL.Query()["tool"])
+			tools, err := registry.Resolve(r.URL.Query()["tool"])
 			if err != nil {
 				writeMessagingError(w, err)
 				return
 			}
-			assignableTools, err := snapshot.Resolve(r.URL.Query()["assignable_tool"])
+			assignableTools, err := registry.Resolve(r.URL.Query()["assignable_tool"])
 			if err != nil {
 				writeMessagingError(w, err)
 				return
@@ -202,7 +174,7 @@ func ServeRuntime(ctx context.Context, socketPath, dataRoot string, pluginDirect
 			http.Error(w, "expected one JSON array", http.StatusBadRequest)
 			return
 		}
-		tools, err := currentRegistry().Resolve(names)
+		tools, err := registry.Resolve(names)
 		if err == nil {
 			err = env.SetAgentTools(r.Context(), r.PathValue("name"), tools)
 		}
@@ -325,12 +297,15 @@ func writeMessagingError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, ErrAgentNotFound):
 		http.Error(w, err.Error(), http.StatusNotFound)
-	case errors.Is(err, ErrAgentExists), errors.Is(err, ErrAgentBusy):
+	case errors.Is(err, ErrAgentExists), errors.Is(err, ErrAgentBusy), errors.Is(err, ErrAgentRunning):
 		http.Error(w, err.Error(), http.StatusConflict)
 	case errors.Is(err, ErrInvalidEnvelope), errors.Is(err, ErrInvalidName), errors.Is(err, ErrModelNotFound), errors.Is(err, ErrModelNotAllowed), errors.Is(err, ErrInvalidTool):
 		http.Error(w, err.Error(), http.StatusBadRequest)
 	case errors.Is(err, ErrEnvironmentClosed), errors.Is(err, context.Canceled):
 		http.Error(w, "environment is stopping", http.StatusServiceUnavailable)
+	case errors.Is(err, ErrAgentDataCleanup):
+		log.Printf("agent file cleanup failed: %v", err)
+		http.Error(w, ErrAgentDataCleanup.Error(), http.StatusInternalServerError)
 	default:
 		log.Printf("messaging operation failed: %v", err)
 		http.Error(w, "messaging operation failed", http.StatusInternalServerError)

@@ -20,7 +20,7 @@ type pluginBinary struct {
 
 func binaryTool(binary *pluginBinary, definition toolplugin.Definition) Tool {
 	return Tool{
-		plugin: binary, Name: definition.Name, Description: definition.Description,
+		Name: definition.Name, Description: definition.Description,
 		Parameters: definition.Parameters, Automatic: definition.Automatic,
 		Execute: func(ctx context.Context, arguments json.RawMessage) (string, error) {
 			return binary.call(ctx, definition.Name, arguments)

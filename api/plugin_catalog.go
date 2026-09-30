@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -64,78 +63,6 @@ func readPlugin(ctx context.Context, path string) (*pluginBinary, error) {
 	return &pluginBinary{Path: absolute, Definitions: manifest.Tools}, nil
 }
 
-func loadPluginCatalogue(ctx context.Context, pluginDirectory string) (ToolRegistry, string, error) {
-	cache, err := os.MkdirTemp("", "micro-catalogue-*")
-	if err != nil {
-		return nil, "", err
-	}
-	success := false
-	defer func() {
-		if !success {
-			os.RemoveAll(cache)
-		}
-	}()
-	registry := DefaultTools()
-	load := func(path string) error {
-		input, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer input.Close()
-		info, err := input.Stat()
-		if err != nil {
-			return err
-		}
-		if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
-			return fmt.Errorf("plugin must be an executable regular file: %s", path)
-		}
-		output, err := os.CreateTemp(cache, "binary-*")
-		if err != nil {
-			return err
-		}
-		if _, err := io.Copy(output, input); err != nil {
-			output.Close()
-			return err
-		}
-		if err := output.Chmod(0700); err != nil {
-			output.Close()
-			return err
-		}
-		if err := output.Close(); err != nil {
-			return err
-		}
-		binary, err := readPlugin(ctx, output.Name())
-		if err != nil {
-			return err
-		}
-		for _, definition := range binary.Definitions {
-			if _, exists := registry[definition.Name]; exists {
-				return fmt.Errorf("%w: duplicate plugin tool %q", ErrInvalidTool, definition.Name)
-			}
-			registry[definition.Name] = binaryTool(binary, definition)
-		}
-		return nil
-	}
-	entries, err := os.ReadDir(pluginDirectory)
-	if err != nil && !os.IsNotExist(err) {
-		return nil, "", err
-	}
-	for _, entry := range entries {
-		if entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
-			continue
-		}
-		path, err := filepath.Abs(filepath.Join(pluginDirectory, entry.Name()))
-		if err != nil {
-			return nil, "", err
-		}
-		if err := load(path); err != nil {
-			return nil, "", fmt.Errorf("load plugin %q: %w", entry.Name(), err)
-		}
-	}
-	success = true
-	return registry, cache, nil
-}
-
 func (env *AgentEnvironment) toolRegistryLocked() ToolRegistry {
 	registry := DefaultTools()
 	for name, tool := range env.registry {
@@ -154,13 +81,6 @@ func (agent *Agent) currentTools() []Tool {
 	binding := ToolContext{Environment: env, Caller: agent.Name, AssignableTools: agent.AssignableTools, AllowedModels: agent.AllowedModels}
 	tools := make([]Tool, 0, len(agent.Tools))
 	for _, tool := range agent.Tools {
-		if tool.plugin != nil && env.registry != nil {
-			if replacement, exists := env.registry[tool.Name]; exists {
-				tool = replacement
-			} else {
-				continue
-			}
-		}
 		if tool.bind != nil {
 			tool = tool.bind(binding)
 		}

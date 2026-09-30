@@ -24,49 +24,21 @@ func TestMain(tests *testing.M) {
 	os.Exit(tests.Run())
 }
 
-func TestPluginCatalogue(t *testing.T) {
+func TestNativeToolRegistry(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
-	for _, directory := range []string{t.TempDir(), filepath.Join(t.TempDir(), "missing")} {
-		registry, cache, err := loadPluginCatalogue(t.Context(), directory)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { os.RemoveAll(cache) })
-		if len(registry) != 9 {
-			t.Fatalf("tool count: %d", len(registry))
-		}
-		for name, tool := range registry {
-			if tool.plugin != nil || tool.bind == nil {
-				t.Fatalf("built-in %s is not native", name)
-			}
-		}
-		tool := registry["get_time"].bind(ToolContext{Environment: &AgentEnvironment{}, Caller: "caller"})
-		result, err := tool.Execute(t.Context(), json.RawMessage(`{"location":"UTC"}`))
-		if err != nil || !strings.HasPrefix(result, "Current time in UTC: ") {
-			t.Fatalf("native call: %q %v", result, err)
+	registry := DefaultTools()
+	if len(registry) != 9 {
+		t.Fatalf("tool count: %d", len(registry))
+	}
+	for name, tool := range registry {
+		if tool.bind == nil {
+			t.Fatalf("built-in %s is not native", name)
 		}
 	}
-}
-
-func TestPluginCannotReplaceBuiltins(t *testing.T) {
-	for _, name := range []string{"get_time", "message"} {
-		t.Run(name, func(t *testing.T) {
-			buildDirectory, pluginDirectory := t.TempDir(), t.TempDir()
-			source := strings.Replace(examplePluginSource, `Name: "echo"`, `Name: "`+name+`"`, 1)
-			if err := buildPlugin(t.Context(), buildDirectory, source); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Rename(filepath.Join(buildDirectory, "tool"), filepath.Join(pluginDirectory, "collision")); err != nil {
-				t.Fatal(err)
-			}
-			_, cache, err := loadPluginCatalogue(t.Context(), pluginDirectory)
-			if cache != "" {
-				t.Cleanup(func() { os.RemoveAll(cache) })
-			}
-			if !errors.Is(err, ErrInvalidTool) {
-				t.Fatalf("plugin replaced native %s: %v", name, err)
-			}
-		})
+	tool := registry["get_time"].bind(ToolContext{Environment: &AgentEnvironment{}, Caller: "caller"})
+	result, err := tool.Execute(t.Context(), json.RawMessage(`{"location":"UTC"}`))
+	if err != nil || !strings.HasPrefix(result, "Current time in UTC: ") {
+		t.Fatalf("native call: %q %v", result, err)
 	}
 }
 
@@ -94,6 +66,14 @@ func TestCreatePlugin(t *testing.T) {
 	if err := agent.executeEnvelope(ctx, Envelope{ID: "request", Source: "cli", To: "maker", Content: "create a tool"}); err != nil {
 		t.Fatal(err)
 	}
+	if len(agent.plugins) != 1 || !strings.HasPrefix(agent.plugins[0].Path, "maker-echo-") ||
+		!strings.HasSuffix(agent.plugins[0].Path, "/bin/echo") || filepath.Base(agent.plugins[0].Binary.Path) != "echo" {
+		t.Fatalf("tool name missing from saved plugin path: %+v", agent.plugins)
+	}
+	info, err := os.Stat(agent.plugins[0].Binary.Path)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 {
+		t.Fatal("named plugin executable missing:", err)
+	}
 	if err := env.CreatePlugin(ctx, "maker", request); !errors.Is(err, ErrInvalidTool) {
 		t.Fatalf("duplicate allowed: %v", err)
 	}
@@ -109,6 +89,10 @@ func TestCreatePlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	loaded := restored.InitialAgent
+	result, err := loaded.plugins[0].Binary.call(ctx, "echo", json.RawMessage(`{"input":"restored"}`))
+	if err != nil || result != "restored" {
+		t.Fatalf("restored named executable failed: %q %v", result, err)
+	}
 	if err := restored.UpdateAgent(ctx, "maker", "test-model", "updated", []Tool{DefaultTools()["create_tool"]}); err != nil {
 		t.Fatal(err)
 	}
@@ -124,78 +108,68 @@ func TestCreatePlugin(t *testing.T) {
 	if err := restored.CreatePlugin(ctx, "maker", request); !errors.Is(err, ErrInvalidTool) {
 		t.Fatalf("revoked permission: %v", err)
 	}
+	directory, _, err := privatePluginPaths(restored.DataRoot, loaded.plugins[0].Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restored.DeleteAgent(ctx, "maker", true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(directory); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("deleting agent did not erase the named plugin directory:", err)
+	}
 }
 
-func TestPluginReplacement(t *testing.T) {
-	ctx, root, _ := setupPersistenceTest(t)
-	pluginDirectory, buildDirectory := t.TempDir(), t.TempDir()
-	install := func(source string) {
-		t.Helper()
-		if err := buildPlugin(ctx, buildDirectory, source); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.Rename(filepath.Join(buildDirectory, "tool"), filepath.Join(pluginDirectory, "echo")); err != nil {
-			t.Fatal(err)
+func TestPrivatePluginPaths(t *testing.T) {
+	root := t.TempDir()
+	for _, saved := range []string{
+		"", ".", "..", "../escape", "/absolute", "dir/../echo", "dir/bin/../echo",
+		"dir/bin/", "dir/bin/UPPER", "dir/bin/echo/extra", "dir/echo", "dir/other/echo",
+		`dir\bin\echo`, "maker-old-id",
+	} {
+		if _, _, err := privatePluginPaths(root, saved); err == nil {
+			t.Errorf("invalid saved path accepted: %q", saved)
 		}
 	}
-	load := func() ToolRegistry {
-		t.Helper()
-		registry, cache, err := loadPluginCatalogue(ctx, pluginDirectory)
+	directory, executable, err := privatePluginPaths(root, "maker-echo-id/bin/echo")
+	if err != nil || executable != filepath.Join(root, "plugins", "maker-echo-id", "bin", "echo") ||
+		directory != filepath.Join(root, "plugins", "maker-echo-id") {
+		t.Fatalf("resolve named plugin: %q %q %v", directory, executable, err)
+	}
+}
+
+func TestPrivatePluginNamesAcrossAgents(t *testing.T) {
+	ctx, root, _ := setupPersistenceTest(t)
+	env, err := NewAgentEnvironment(ctx, root, "names")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, owner := range []string{"first", "second"} {
+		agent, err := env.CreateAgent(ctx, "test-model", []Tool{DefaultTools()["create_tool"]}, owner, "", false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		t.Cleanup(func() { os.RemoveAll(cache) })
-		return registry
-	}
-	install(examplePluginSource)
-	first := load()
-	env, err := NewAgentEnvironment(ctx, root, "replacement")
-	if err != nil {
-		t.Fatal(err)
-	}
-	env.registry = first
-	agent, err := env.CreateAgent(ctx, "test-model", []Tool{first["echo"]}, "user", "", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var old Tool
-	for _, tool := range agent.currentTools() {
-		if tool.Name == "echo" {
-			old = tool
+		request := CreatePluginRequest{
+			Name: "toolplugin", Source: strings.Replace(examplePluginSource, `Name: "echo"`, `Name: "toolplugin"`, 1),
+			TestArguments: `{"input":"hello"}`, ExpectedOutput: "hello",
+		}
+		if err := env.CreatePlugin(ctx, owner, request); err != nil {
+			t.Fatal(err)
+		}
+		paths = append(paths, agent.plugins[0].Binary.Path)
+		if filepath.Base(paths[len(paths)-1]) != "toolplugin" {
+			t.Fatal("tool name collides with SDK directory")
 		}
 	}
-	install(strings.Replace(examplePluginSource, "return arguments.Input, nil", `return arguments.Input + "!", nil`, 1))
-	env.mu.Lock()
-	env.registry = load()
-	env.mu.Unlock()
-	for _, tool := range agent.currentTools() {
-		if tool.Name == "echo" {
-			result, err := tool.Execute(ctx, json.RawMessage(`{"input":"new"}`))
-			if err != nil || result != "new!" {
-				t.Fatalf("replacement: %q %v", result, err)
-			}
+	if paths[0] == paths[1] {
+		t.Fatal("agents share a private executable")
+	}
+	for _, agent := range env.Agents {
+		result, err := agent.plugins[0].Binary.call(ctx, "toolplugin", json.RawMessage(`{"input":"hello"}`))
+		if err != nil || result != "hello" {
+			t.Fatalf("private executable failed: %q %v", result, err)
 		}
-	}
-	result, err := old.Execute(ctx, json.RawMessage(`{"input":"old"}`))
-	if err != nil || result != "old" {
-		t.Fatalf("old snapshot changed: %q %v", result, err)
-	}
-	if err := os.Remove(filepath.Join(pluginDirectory, "echo")); err != nil {
-		t.Fatal(err)
-	}
-	env.mu.Lock()
-	env.registry = load()
-	env.mu.Unlock()
-	for _, tool := range agent.currentTools() {
-		if tool.Name == "echo" {
-			t.Fatal("removed plugin still offered")
-		}
-		if tool.plugin != nil || !tool.Automatic {
-			t.Fatalf("reload changed native automatic tool %s", tool.Name)
-		}
-	}
-	if len(agent.currentTools()) != 6 {
-		t.Fatal("reload removed native automatic tools")
 	}
 }
 

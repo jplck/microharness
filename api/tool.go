@@ -31,7 +31,6 @@ type ToolContext struct {
 }
 
 type Tool struct {
-	plugin      *pluginBinary
 	bind        func(ToolContext) Tool
 	Automatic   bool
 	Name        string

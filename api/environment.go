@@ -125,12 +125,16 @@ func LoadAgentEnvironment(ctx context.Context, dataRoot, name string, registry T
 			return nil, fmt.Errorf("restore agent %q: %w", saved.Name, err)
 		}
 		for _, name := range saved.Plugins {
-			if !validStateName.MatchString(name) {
-				return nil, fmt.Errorf("invalid saved plugin path %q", name)
+			_, path, err := privatePluginPaths(directory, name)
+			if err != nil {
+				return nil, err
 			}
-			binary, err := readPlugin(ctx, filepath.Join(directory, "plugins", name, "tool"))
+			binary, err := readPlugin(ctx, path)
 			if err != nil {
 				return nil, fmt.Errorf("restore agent %q plugin: %w", saved.Name, err)
+			}
+			if len(binary.Definitions) != 1 || binary.Definitions[0].Name != filepath.Base(path) {
+				return nil, fmt.Errorf("restore agent %q plugin: expected one tool matching the executable name", saved.Name)
 			}
 			agent.plugins = append(agent.plugins, ownedPlugin{Path: name, Binary: binary})
 		}
